@@ -30,6 +30,7 @@ use core::fmt::{Debug, Formatter};
 use amplify::confinement::SmallOrdMap;
 use amplify::ByteArray;
 use single_use_seals::{PublishedWitness, SealError, SealWitness};
+use tracing::error;
 use ultrasonic::{
     AuthToken, CallError, CellAddr, Codex, ContractId, LibRepo, Memory, Operation, Opid, VerifiedOperation,
 };
@@ -154,11 +155,28 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
         let mut is_genesis = true;
         let mut seals = BTreeMap::<CellAddr, Seal>::new();
+        let total_start = std::time::Instant::now();
+        let mut op_count = 0usize;
+        let mut known_ops = 0usize;
+        let mut witness_ops = 0usize;
+        let mut read_ms = 0u128;
+        let mut verify_ms = 0u128;
+        let mut witness_verify_ms = 0u128;
+        let mut apply_witness_ms = 0u128;
+        let mut apply_operation_ms = 0u128;
+        let mut apply_seals_ms = 0u128;
 
-        while let Some(mut block) = reader
-            .read_operation()
-            .map_err(|e| VerificationError::Stream(Box::new(e)))?
-        {
+        loop {
+            let read_start = std::time::Instant::now();
+            let Some(mut block) = reader
+                .read_operation()
+                .map_err(|e| VerificationError::Stream(Box::new(e)))?
+            else {
+                break;
+            };
+            read_ms += read_start.elapsed().as_millis();
+            op_count += 1;
+
             // Genesis cannot commit to the contract id since the contract does not exist yet;
             // thus, we have to apply this little trick
             if is_genesis {
@@ -204,12 +222,15 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // If the operation was validated before, we need to skip its validation, since its inputs are not a
             // part of the state anymore.
             let operation = if self.is_known(opid) {
+                known_ops += 1;
                 None
             } else {
                 // Verify the operation
+                let verify_start = std::time::Instant::now();
                 let verified = self
                     .codex()
                     .verify(contract_id, block.operation, self.memory(), self.repo())?;
+                verify_ms += verify_start.elapsed().as_millis();
                 Some(verified)
             };
 
@@ -223,10 +244,13 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 .collect();
 
             if let Some(witness) = block.witness {
+                witness_ops += 1;
                 let msg = opid.to_byte_array();
+                let witness_verify_start = std::time::Instant::now();
                 witness
                     .verify_seals_closing(&closed_seals, msg.into())
                     .map_err(|e| VerificationError::SealsNotClosed(witness.published.pub_id(), opid, e))?;
+                witness_verify_ms += witness_verify_start.elapsed().as_millis();
 
                 //  Each witness actually produces its own set of witness-output-based seal sources.
                 let pub_id = witness.published.pub_id();
@@ -237,7 +261,9 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     .map(|(pos, seal)| (CellAddr::new(opid, *pos), seal.resolve(pub_id)));
                 seal_sources.extend(iter);
 
+                let apply_witness_start = std::time::Instant::now();
                 self.apply_witness(opid, witness);
+                apply_witness_ms += apply_witness_start.elapsed().as_millis();
             } else if !closed_seals.is_empty() {
                 return Err(VerificationError::NoWitness(opid));
             }
@@ -246,13 +272,32 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             if is_genesis {
                 is_genesis = false
             } else if let Some(operation) = operation {
+                let apply_operation_start = std::time::Instant::now();
                 self.apply_operation(operation);
+                apply_operation_ms += apply_operation_start.elapsed().as_millis();
             }
 
             if !block.defined_seals.is_empty() {
+                let apply_seals_start = std::time::Instant::now();
                 self.apply_seals(opid, block.defined_seals);
+                apply_seals_ms += apply_seals_start.elapsed().as_millis();
             }
         }
+
+        error!(
+            contract_id = %contract_id,
+            op_count,
+            known_ops,
+            witness_ops,
+            read_ms,
+            verify_ms,
+            witness_verify_ms,
+            apply_witness_ms,
+            apply_operation_ms,
+            apply_seals_ms,
+            total_elapsed_ms = total_start.elapsed().as_millis(),
+            "contract.evaluate: finished"
+        );
 
         Ok(())
     }
