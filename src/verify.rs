@@ -115,6 +115,12 @@ pub trait ContractApi<Seal: RgbSeal> {
     /// The method MUST return `true` for genesis operation.
     fn is_known(&self, opid: Opid) -> bool;
 
+    /// Detects whether a witness for a known operation is already stored and validated.
+    ///
+    /// Implementations may return `true` only when the exact witness has already been accepted for
+    /// `opid`. Returning `false` preserves the default full verification path.
+    fn is_witness_known(&mut self, _opid: Opid, _witness: &SealWitness<Seal>) -> bool { false }
+
     /// # Nota bene:
     ///
     /// The method is called only for those operations which are not known (i.e. [`Self::is_known`]
@@ -203,7 +209,8 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
             // If the operation was validated before, we need to skip its validation, since its inputs are not a
             // part of the state anymore.
-            let operation = if self.is_known(opid) {
+            let known = self.is_known(opid);
+            let operation = if known {
                 None
             } else {
                 // Verify the operation
@@ -223,11 +230,6 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 .collect();
 
             if let Some(witness) = block.witness {
-                let msg = opid.to_byte_array();
-                witness
-                    .verify_seals_closing(&closed_seals, msg.into())
-                    .map_err(|e| VerificationError::SealsNotClosed(witness.published.pub_id(), opid, e))?;
-
                 //  Each witness actually produces its own set of witness-output-based seal sources.
                 let pub_id = witness.published.pub_id();
                 let iter = block
@@ -237,7 +239,15 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     .map(|(pos, seal)| (CellAddr::new(opid, *pos), seal.resolve(pub_id)));
                 seal_sources.extend(iter);
 
-                self.apply_witness(opid, witness);
+                let witness_known = known && self.is_witness_known(opid, &witness);
+                if !witness_known {
+                    let msg = opid.to_byte_array();
+                    witness
+                        .verify_seals_closing(&closed_seals, msg.into())
+                        .map_err(|e| VerificationError::SealsNotClosed(pub_id, opid, e))?;
+
+                    self.apply_witness(opid, witness);
+                }
             } else if !closed_seals.is_empty() {
                 return Err(VerificationError::NoWitness(opid));
             }
