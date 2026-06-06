@@ -204,19 +204,30 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 return Err(VerificationError::SealsDefinitionMismatch { opid, reported, defined, sources });
             }
 
-            // Collect single-use seal closings by the operation
-            let mut closed_seals = Vec::<Seal>::new();
-            for input in &block.operation.destructible_in {
-                let seal = seals
-                    .remove(&input.addr)
-                    .or_else(|| self.known_seal(input.addr))
-                    .ok_or(VerificationError::SealUnknown(input.addr))?;
-                closed_seals.push(seal);
-            }
-
             // If the operation was validated before, we need to skip its validation, since its inputs are not a
             // part of the state anymore.
             let known = self.is_known(opid);
+            let witness_known = match block.witness.as_ref() {
+                Some(witness) if known => self.is_witness_known(opid, witness),
+                _ => false,
+            };
+
+            // Collect single-use seal closings by the operation
+            let mut closed_seals = Vec::<Seal>::new();
+            if witness_known {
+                for input in &block.operation.destructible_in {
+                    seals.remove(&input.addr);
+                }
+            } else {
+                for input in &block.operation.destructible_in {
+                    let seal = seals
+                        .remove(&input.addr)
+                        .or_else(|| self.known_seal(input.addr))
+                        .ok_or(VerificationError::SealUnknown(input.addr))?;
+                    closed_seals.push(seal);
+                }
+            }
+
             let operation = if known {
                 None
             } else {
@@ -246,7 +257,6 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     .map(|(pos, seal)| (CellAddr::new(opid, *pos), seal.resolve(pub_id)));
                 seal_sources.extend(iter);
 
-                let witness_known = known && self.is_witness_known(opid, &witness);
                 if !witness_known {
                     let msg = opid.to_byte_array();
                     witness
