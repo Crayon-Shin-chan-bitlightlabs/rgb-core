@@ -121,6 +121,12 @@ pub trait ContractApi<Seal: RgbSeal> {
     /// `opid`. Returning `false` preserves the default full verification path.
     fn is_witness_known(&mut self, _opid: Opid, _witness: &SealWitness<Seal>) -> bool { false }
 
+    /// Returns a previously verified resolved seal for a known state cell.
+    ///
+    /// This is only used when a consignment intentionally omits already-known ancestor operations.
+    /// Returning `None` preserves the default full-history verification path.
+    fn known_seal(&mut self, _addr: CellAddr) -> Option<Seal> { None }
+
     /// # Nota bene:
     ///
     /// The method is called only for those operations which are not known (i.e. [`Self::is_known`]
@@ -203,6 +209,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             for input in &block.operation.destructible_in {
                 let seal = seals
                     .remove(&input.addr)
+                    .or_else(|| self.known_seal(input.addr))
                     .ok_or(VerificationError::SealUnknown(input.addr))?;
                 closed_seals.push(seal);
             }
