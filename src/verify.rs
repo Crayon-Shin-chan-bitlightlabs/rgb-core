@@ -127,6 +127,14 @@ pub trait ContractApi<Seal: RgbSeal> {
     /// Returning `None` preserves the default full-history verification path.
     fn known_seal(&mut self, _addr: CellAddr) -> Option<Seal> { None }
 
+    /// Detects whether the provided seal definitions are already stored for a known operation.
+    ///
+    /// Implementations may return `true` only when every provided definition exactly matches
+    /// previously accepted data. Returning `false` preserves the default full-history path.
+    fn are_seals_known(&mut self, _opid: Opid, _seals: &SmallOrdMap<u16, Seal::Definition>) -> bool {
+        false
+    }
+
     /// # Nota bene:
     ///
     /// The method is called only for those operations which are not known (i.e. [`Self::is_known`]
@@ -211,6 +219,13 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 Some(witness) if known => self.is_witness_known(opid, witness),
                 _ => false,
             };
+
+            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+                for input in &block.operation.destructible_in {
+                    seals.remove(&input.addr);
+                }
+                continue;
+            }
 
             // Collect single-use seal closings by the operation
             let mut closed_seals = Vec::<Seal>::new();
