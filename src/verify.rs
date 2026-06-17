@@ -225,8 +225,10 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             };
 
             if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
-                for input in &block.operation.destructible_in {
-                    seals.remove(&input.addr);
+                if !seals.is_empty() {
+                    for input in &block.operation.destructible_in {
+                        seals.remove(&input.addr);
+                    }
                 }
                 continue;
             }
@@ -234,8 +236,10 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // Collect single-use seal closings by the operation
             let mut closed_seals = Vec::<Seal>::new();
             if witness_known {
-                for input in &block.operation.destructible_in {
-                    seals.remove(&input.addr);
+                if !seals.is_empty() {
+                    for input in &block.operation.destructible_in {
+                        seals.remove(&input.addr);
+                    }
                 }
             } else {
                 for input in &block.operation.destructible_in {
