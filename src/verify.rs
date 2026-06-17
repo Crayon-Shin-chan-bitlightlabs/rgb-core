@@ -260,21 +260,15 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // This convoluted logic happens since we use a state machine which ensures the client can't lie to
             // the verifier
             // Now we can add operation-defined seals to the set of known seals
-            let mut seal_sources: BTreeSet<_> = block
-                .defined_seals
-                .iter()
-                .filter_map(|(pos, seal)| seal.to_src().map(|seal| (CellAddr::new(opid, *pos), seal)))
-                .collect();
-
             if let Some(witness) = block.witness {
                 //  Each witness actually produces its own set of witness-output-based seal sources.
                 let pub_id = witness.published.pub_id();
-                let iter = block
-                    .defined_seals
-                    .iter()
-                    .filter(|(_, seal)| seal.to_src().is_none())
-                    .map(|(pos, seal)| (CellAddr::new(opid, *pos), seal.resolve(pub_id)));
-                seal_sources.extend(iter);
+
+                for (pos, seal) in block.defined_seals.iter() {
+                    let addr = CellAddr::new(opid, *pos);
+                    let seal = seal.to_src().unwrap_or_else(|| seal.resolve(pub_id));
+                    seals.insert(addr, seal);
+                }
 
                 if !witness_known {
                     let msg = opid.to_byte_array();
@@ -284,11 +278,18 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
                     self.apply_witness(opid, witness);
                 }
-            } else if !closed_seals.is_empty() {
-                return Err(VerificationError::NoWitness(opid));
+            } else {
+                for (pos, seal) in block.defined_seals.iter() {
+                    if let Some(seal) = seal.to_src() {
+                        seals.insert(CellAddr::new(opid, *pos), seal);
+                    }
+                }
+
+                if !closed_seals.is_empty() {
+                    return Err(VerificationError::NoWitness(opid));
+                }
             }
 
-            seals.extend(seal_sources);
             if is_genesis {
                 is_genesis = false
             } else if let Some(operation) = operation {
