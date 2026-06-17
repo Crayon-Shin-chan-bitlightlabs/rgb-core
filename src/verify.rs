@@ -189,6 +189,25 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             }
             let opid = block.operation.opid();
 
+            // If the full operation aux data has already been accepted, the
+            // stored seal definitions were validated against this operation
+            // before. Unknown or partially known aux data still falls through
+            // to the normal subset and witness checks below.
+            let known = self.is_known(opid);
+            let witness_known = match block.witness.as_ref() {
+                Some(witness) if known => self.is_witness_known(opid, witness),
+                _ => false,
+            };
+
+            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+                if !seals.is_empty() {
+                    for input in &block.operation.destructible_in {
+                        seals.remove(&input.addr);
+                    }
+                }
+                continue;
+            }
+
             // We need to check that all seal definitions strictly match operation-defined destructible cells
             // It is a subset and not an equal set since some seals might be unknown to us:
             // we know their commitment auth token but do not know the definition.
@@ -214,23 +233,6 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     .map(|(pos, seal)| (*pos, seal.to_string()))
                     .collect();
                 return Err(VerificationError::SealsDefinitionMismatch { opid, reported, defined, sources });
-            }
-
-            // If the operation was validated before, we need to skip its validation, since its inputs are not a
-            // part of the state anymore.
-            let known = self.is_known(opid);
-            let witness_known = match block.witness.as_ref() {
-                Some(witness) if known => self.is_witness_known(opid, witness),
-                _ => false,
-            };
-
-            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
-                if !seals.is_empty() {
-                    for input in &block.operation.destructible_in {
-                        seals.remove(&input.addr);
-                    }
-                }
-                continue;
             }
 
             // Collect single-use seal closings by the operation
