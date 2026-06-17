@@ -190,20 +190,24 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             let opid = block.operation.opid();
 
             // We need to check that all seal definitions strictly match operation-defined destructible cells
-            let defined = block
-                .operation
-                .destructible_out
-                .iter()
-                .map(|cell| cell.auth)
-                .collect::<BTreeSet<_>>();
-            let reported = block
-                .defined_seals
-                .values()
-                .map(|seal| seal.auth_token())
-                .collect::<BTreeSet<_>>();
             // It is a subset and not an equal set since some seals might be unknown to us:
             // we know their commitment auth token but do not know the definition.
-            if !reported.is_subset(&defined) {
+            let reported_is_subset = block.defined_seals.values().all(|seal| {
+                let auth = seal.auth_token();
+                block.operation.destructible_out.iter().any(|cell| cell.auth == auth)
+            });
+            if !reported_is_subset {
+                let defined = block
+                    .operation
+                    .destructible_out
+                    .iter()
+                    .map(|cell| cell.auth)
+                    .collect::<BTreeSet<_>>();
+                let reported = block
+                    .defined_seals
+                    .values()
+                    .map(|seal| seal.auth_token())
+                    .collect::<BTreeSet<_>>();
                 let sources = block
                     .defined_seals
                     .iter()
