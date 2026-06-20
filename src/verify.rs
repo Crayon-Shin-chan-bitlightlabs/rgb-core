@@ -189,24 +189,28 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             }
             let opid = block.operation.opid();
 
-            // If the full operation aux data has already been accepted, the
-            // stored seal definitions were validated against this operation
-            // before. Unknown or partially known aux data still falls through
-            // to the normal subset and witness checks below.
+            // If the operation is already valid locally and its seal
+            // definitions match local stock, the operation was already
+            // verified before. Incoming witness aux data may be absent or not
+            // materialized for older stocks, so do not replay the historical
+            // close path just to validate duplicate data we will not persist.
             let known = self.is_known(opid);
-            let witness_known = match block.witness.as_ref() {
-                Some(witness) if known => self.is_witness_known(opid, witness),
-                _ => false,
-            };
-
-            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+            if known && self.are_seals_known(opid, &block.defined_seals) {
                 if !seals.is_empty() {
                     for input in &block.operation.destructible_in {
                         seals.remove(&input.addr);
                     }
                 }
+                if is_genesis {
+                    is_genesis = false;
+                }
                 continue;
             }
+
+            let witness_known = match block.witness.as_ref() {
+                Some(witness) if known => self.is_witness_known(opid, witness),
+                _ => false,
+            };
 
             // We need to check that all seal definitions strictly match operation-defined destructible cells
             // It is a subset and not an equal set since some seals might be unknown to us:
