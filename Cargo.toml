@@ -25,12 +25,17 @@ single_use_seals = { version = "~0.12.0", features = ["strict_encoding"] }
 ultrasonic = "0.12.0"
 bp-core = { version = "0.12.0", optional = true }
 serde = { version = "1", optional = true }
+rayon = { version = "1.10", optional = true }
 
 [features]
 default = ["std", "bitcoin"]
-all = ["std", "bitcoin", "liquid", "prime", "serde"]
+all = ["std", "bitcoin", "liquid", "prime", "serde", "parallel"]
 
 std = []
+
+# Experimental (spike): topology-parallel DAG verification via rayon. Off by default; the serial
+# `evaluate` path is unchanged. Requires std.
+parallel = ["std", "dep:rayon"]
 
 bitcoin = ["bp-core"]
 liquid = ["bp-core"]

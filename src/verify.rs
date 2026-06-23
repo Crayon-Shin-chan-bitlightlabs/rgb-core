@@ -157,6 +157,24 @@ pub trait ContractApi<Seal: RgbSeal> {
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<Seal>);
 }
 
+/// Provides a `Sync`, read-only view of a contract's verification memory and lib repo so that
+/// [`ContractVerify::evaluate_parallel`] can share it across rayon worker threads.
+///
+/// This is what lets a non-`Sync` contract (e.g. one backed by a DB session plus interior-mutable
+/// caches) still drive parallel verification: only the immutable verification state is exposed via
+/// the borrowed context, never the mutable / DB-backed parts (which stay on the serial path).
+#[cfg(feature = "parallel")]
+pub trait ParallelVerifyMemory {
+    /// A `Sync` read-only verification context borrowed from `&self`.
+    type Ctx<'a>: Memory + LibRepo + Sync
+    where
+        Self: 'a;
+
+    /// Borrow a `Sync` read-only verification context. It MUST resolve the same memory cells as
+    /// [`ContractApi::memory`] for every operation reachable during verification.
+    fn verify_context(&self) -> Self::Ctx<'_>;
+}
+
 /// Main implementation of the contract verification procedure.
 ///
 /// # Nota bene
@@ -309,6 +327,276 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
         Ok(())
     }
+
+    /// Experimental topology-parallel variant of [`Self::evaluate`] (spike, feature `parallel`).
+    ///
+    /// Semantically equivalent to `evaluate` for accepted consignments: operations are grouped
+    /// into dependency layers (a topological partition in which same-layer operations never
+    /// consume each other's seals or read each other's applied state), each layer's read-only
+    /// verification (`Codex::verify` + `verify_seals_closing`) runs in parallel via rayon, and the
+    /// side-effecting apply (`seals` map + `apply_*`) runs serially in topological order. The
+    /// serial `evaluate` remains the authority; this path is off by default.
+    ///
+    /// Known spike limitation: for an *invalid* consignment with several independent faults the
+    /// returned error may differ from `evaluate`, because faults short-circuit per layer rather
+    /// than in global stream order. A full implementation would collect all faults and return the
+    /// earliest in stream order. Valid consignments produce byte-for-byte identical ledger state.
+    #[cfg(feature = "parallel")]
+    #[allow(clippy::result_large_err)]
+    fn evaluate_parallel<R: ReadOperation<Seal = Seal>>(
+        &mut self,
+        mut reader: R,
+    ) -> Result<(), VerificationError<Seal>>
+    where
+        Self: Sized + ParallelVerifyMemory,
+        Seal: Send + Sync,
+        Seal::Definition: Send + Sync,
+        SealWitness<Seal>: Clone + Sync,
+    {
+        use rayon::prelude::*;
+
+        let contract_id = self.contract_id();
+        let codex_id = self.codex().codex_id();
+
+        // 1) Drain the whole consignment; apply the genesis contract-id fixup to the first op.
+        let mut blocks = Vec::<OperationSeals<Seal>>::new();
+        let mut is_first = true;
+        while let Some(mut block) = reader
+            .read_operation()
+            .map_err(|e| VerificationError::Stream(Box::new(e)))?
+        {
+            if is_first {
+                if block.operation.contract_id.to_byte_array() != codex_id.to_byte_array() {
+                    return Err(VerificationError::NoCodexCommitment);
+                }
+                block.operation.contract_id = contract_id;
+                is_first = false;
+            }
+            blocks.push(block);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        // 2) Opids + opid -> stream index.
+        let opids = blocks.iter().map(|b| b.operation.opid()).collect::<Vec<_>>();
+        let mut index = BTreeMap::<Opid, usize>::new();
+        for (i, opid) in opids.iter().enumerate() {
+            index.insert(*opid, i);
+        }
+
+        // 3) Dependency layering (Kahn). Edge producer -> consumer for every in-batch input
+        //    (`destructible_in` addr opid and `immutable_in` opid). Genesis (idx 0) has no deps.
+        let n = blocks.len();
+        let mut indegree = alloc::vec![0usize; n];
+        let mut dependents = Vec::<Vec<usize>>::new();
+        dependents.resize_with(n, Vec::new);
+        for (i, block) in blocks.iter().enumerate() {
+            let mut deps = BTreeSet::<usize>::new();
+            for input in &block.operation.destructible_in {
+                if let Some(&p) = index.get(&input.addr.opid) {
+                    if p != i {
+                        deps.insert(p);
+                    }
+                }
+            }
+            for addr in &block.operation.immutable_in {
+                if let Some(&p) = index.get(&addr.opid) {
+                    if p != i {
+                        deps.insert(p);
+                    }
+                }
+            }
+            for p in deps {
+                dependents[p].push(i);
+                indegree[i] += 1;
+            }
+        }
+        let mut layers = Vec::<Vec<usize>>::new();
+        let mut frontier = (0..n).filter(|&i| indegree[i] == 0).collect::<Vec<_>>();
+        let mut emitted = 0usize;
+        while !frontier.is_empty() {
+            frontier.sort_unstable(); // deterministic, preserves stream order within a layer
+            let mut next = Vec::<usize>::new();
+            for &i in &frontier {
+                emitted += 1;
+                for &d in &dependents[i] {
+                    indegree[d] -= 1;
+                    if indegree[d] == 0 {
+                        next.push(d);
+                    }
+                }
+            }
+            layers.push(frontier);
+            frontier = next;
+        }
+        // A valid consignment DAG cannot cycle; if it somehow does, fall back to one serial layer
+        // so verification still rejects it rather than silently dropping operations.
+        if emitted != n {
+            layers = alloc::vec![(0..n).collect::<Vec<usize>>()];
+        }
+
+        // Per-op work carried from the serial pre-pass into parallel verify and serial apply.
+        struct Prep<Seal: RgbSeal> {
+            idx: usize,
+            opid: Opid,
+            operation: Operation,
+            defined_seals: SmallOrdMap<u16, Seal::Definition>,
+            witness: Option<SealWitness<Seal>>,
+            closed_seals: Vec<Seal>,
+            known: bool,
+            witness_known: bool,
+        }
+
+        let mut seals = BTreeMap::<CellAddr, Seal>::new();
+
+        for layer in layers {
+            // (a) Serial pre-pass: known checks, subset validation, gather closed seals.
+            let mut preps = Vec::<Prep<Seal>>::new();
+            for &i in &layer {
+                let opid = opids[i];
+                let known = self.is_known(opid);
+                let witness_known = match blocks[i].witness.as_ref() {
+                    Some(witness) if known => self.is_witness_known(opid, witness),
+                    _ => false,
+                };
+
+                if known && witness_known && self.are_seals_known(opid, &blocks[i].defined_seals) {
+                    for input in &blocks[i].operation.destructible_in {
+                        seals.remove(&input.addr);
+                    }
+                    continue;
+                }
+
+                let reported_is_subset = blocks[i].defined_seals.values().all(|seal| {
+                    let auth = seal.auth_token();
+                    blocks[i]
+                        .operation
+                        .destructible_out
+                        .iter()
+                        .any(|cell| cell.auth == auth)
+                });
+                if !reported_is_subset {
+                    let defined = blocks[i]
+                        .operation
+                        .destructible_out
+                        .iter()
+                        .map(|cell| cell.auth)
+                        .collect::<BTreeSet<_>>();
+                    let reported = blocks[i]
+                        .defined_seals
+                        .values()
+                        .map(|seal| seal.auth_token())
+                        .collect::<BTreeSet<_>>();
+                    let sources = blocks[i]
+                        .defined_seals
+                        .iter()
+                        .map(|(pos, seal)| (*pos, seal.to_string()))
+                        .collect();
+                    return Err(VerificationError::SealsDefinitionMismatch {
+                        opid,
+                        reported,
+                        defined,
+                        sources,
+                    });
+                }
+
+                let mut closed_seals = Vec::<Seal>::new();
+                if witness_known {
+                    for input in &blocks[i].operation.destructible_in {
+                        seals.remove(&input.addr);
+                    }
+                } else {
+                    for input in &blocks[i].operation.destructible_in {
+                        let seal = seals
+                            .remove(&input.addr)
+                            .or_else(|| self.known_seal(input.addr))
+                            .ok_or(VerificationError::SealUnknown(input.addr))?;
+                        closed_seals.push(seal);
+                    }
+                }
+
+                preps.push(Prep {
+                    idx: i,
+                    opid,
+                    operation: blocks[i].operation.clone(),
+                    defined_seals: blocks[i].defined_seals.clone(),
+                    witness: blocks[i].witness.clone(),
+                    closed_seals,
+                    known,
+                    witness_known,
+                });
+            }
+
+            // (b) Parallel verify (read-only on self): the AluVM script + lock script — the
+            //     dominant per-op CPU cost. Single-use-seal closing stays in the serial apply
+            //     phase below to avoid plumbing the seal `SealError` (whose witness-error
+            //     associated types are not `Send`) across rayon worker threads.
+            // A `Sync` read-only verification context borrowed from `&self` is what allows a
+            // non-`Sync` contract to verify in parallel: rayon shares `&ctx` across threads while
+            // the mutable/DB parts of `self` stay untouched until the serial apply below.
+            let codex = self.codex();
+            let ctx = self.verify_context();
+            let verified: Vec<Option<Result<VerifiedOperation, CallError>>> = preps
+                .par_iter()
+                .map(|prep| {
+                    if prep.known {
+                        None
+                    } else {
+                        Some(codex.verify(contract_id, prep.operation.clone(), &ctx, &ctx))
+                    }
+                })
+                .collect();
+            drop(ctx);
+
+            // (c) Serial apply in topological (stream) order: seal closing + side effects.
+            for (prep, op_result) in preps.into_iter().zip(verified) {
+                let opid = prep.opid;
+                let operation = match op_result {
+                    Some(Ok(verified)) => Some(verified),
+                    Some(Err(err)) => return Err(err.into()),
+                    None => None,
+                };
+
+                if let Some(witness) = prep.witness {
+                    let pub_id = witness.published.pub_id();
+                    for (pos, seal) in prep.defined_seals.iter() {
+                        let addr = CellAddr::new(opid, *pos);
+                        let seal = seal.to_src().unwrap_or_else(|| seal.resolve(pub_id));
+                        seals.insert(addr, seal);
+                    }
+                    if !prep.witness_known {
+                        let msg = opid.to_byte_array();
+                        witness
+                            .verify_seals_closing(&prep.closed_seals, msg.into())
+                            .map_err(|err| VerificationError::SealsNotClosed(pub_id, opid, err))?;
+                        self.apply_witness(opid, witness);
+                    }
+                } else {
+                    for (pos, seal) in prep.defined_seals.iter() {
+                        if let Some(seal) = seal.to_src() {
+                            seals.insert(CellAddr::new(opid, *pos), seal);
+                        }
+                    }
+                    if !prep.closed_seals.is_empty() {
+                        return Err(VerificationError::NoWitness(opid));
+                    }
+                }
+
+                // Genesis (idx 0) is never applied as an operation, mirroring the serial path.
+                if prep.idx != 0 {
+                    if let Some(operation) = operation {
+                        self.apply_operation(operation);
+                    }
+                }
+                if !prep.defined_seals.is_empty() {
+                    self.apply_seals(opid, prep.defined_seals);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<Seal: RgbSeal, C: ContractApi<Seal>> ContractVerify<Seal> for C {}
@@ -435,6 +723,23 @@ mod test {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    struct TestVerifyCtx<'a>(&'a TestContract);
+    #[cfg(feature = "parallel")]
+    impl Memory for TestVerifyCtx<'_> {
+        fn destructible(&self, addr: CellAddr) -> Option<StateCell> { self.0.destructible(addr) }
+        fn immutable(&self, addr: CellAddr) -> Option<StateValue> { self.0.immutable(addr) }
+    }
+    #[cfg(feature = "parallel")]
+    impl LibRepo for TestVerifyCtx<'_> {
+        fn get_lib(&self, lib_id: LibId) -> Option<&Lib> { self.0.get_lib(lib_id) }
+    }
+    #[cfg(feature = "parallel")]
+    impl super::ParallelVerifyMemory for TestContract {
+        type Ctx<'a> = TestVerifyCtx<'a>;
+        fn verify_context(&self) -> TestVerifyCtx<'_> { TestVerifyCtx(self) }
+    }
+
     fn lib() -> Lib {
         let code = aluasm! {
             stop;
@@ -518,6 +823,109 @@ mod test {
             destructible_out: Default::default(),
             immutable_out: Default::default(),
         }
+    }
+
+    /// An input-free operation that only appends immutable state. Distinct `tag`s yield distinct
+    /// opids, so several of these form one topological layer (no op depends on another) and have no
+    /// witness/seal-closing requirement — ideal for exercising the parallel verify path.
+    #[cfg(feature = "parallel")]
+    fn standalone_op(tag: u64, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: Default::default(),
+            immutable_in: Default::default(),
+            destructible_out: Default::default(),
+            immutable_out: small_vec![StateData::new(0u64, tag)],
+        }
+    }
+
+    /// Assert that the serial `evaluate` and the parallel `evaluate_parallel` reach byte-identical
+    /// ledger state on success, and the same error on failure.
+    #[cfg(feature = "parallel")]
+    fn assert_serial_parallel_equiv(reader: TestReader) {
+        let mut serial = contract();
+        let serial_res = serial.evaluate(reader.clone());
+        let mut parallel = contract();
+        let parallel_res = parallel.evaluate_parallel(reader);
+
+        match (&serial_res, &parallel_res) {
+            (Ok(()), Ok(())) => {
+                assert_eq!(serial.known_ops, parallel.known_ops, "known_ops diverged");
+                assert_eq!(serial.owned, parallel.owned, "owned state diverged");
+                assert_eq!(serial.global, parallel.global, "global state diverged");
+                assert_eq!(
+                    serial.seal_definitions, parallel.seal_definitions,
+                    "seal definitions diverged"
+                );
+                assert_eq!(serial.witnesses, parallel.witnesses, "witnesses diverged");
+            }
+            (Err(serial_err), Err(parallel_err)) => {
+                assert_eq!(
+                    serial_err.to_string(),
+                    parallel_err.to_string(),
+                    "error mismatch"
+                );
+            }
+            _ => panic!("serial and parallel evaluation disagree on success/failure"),
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_equiv_empty() {
+        assert_serial_parallel_equiv(TestReader::new(vec![]));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_equiv_genesis_only() {
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        assert_serial_parallel_equiv(TestReader::new(vec![OperationSeals {
+            operation: genesis_op,
+            defined_seals: none!(),
+            witness: None,
+        }]));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_equiv_wide_layer() {
+        // genesis + several independent input-free ops: one wide topological layer that actually
+        // exercises concurrent verification, and must match the serial result exactly.
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let contract_id = contract().contract_id;
+        let mut ops = vec![OperationSeals {
+            operation: genesis_op,
+            defined_seals: none!(),
+            witness: None,
+        }];
+        for tag in 1..=6u64 {
+            ops.push(OperationSeals {
+                operation: standalone_op(tag, contract_id),
+                defined_seals: none!(),
+                witness: None,
+            });
+        }
+        assert_serial_parallel_equiv(TestReader::new(ops));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_equiv_seal_unknown_error() {
+        // A consuming op with no available seal must fail identically on both paths.
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let operation = operation();
+        assert_serial_parallel_equiv(TestReader::new(vec![
+            OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+            OperationSeals { operation, defined_seals: none!(), witness: None },
+        ]));
     }
 
     #[allow(clippy::result_large_err)]

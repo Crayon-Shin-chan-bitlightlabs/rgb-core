@@ -61,6 +61,8 @@ mod seals;
 pub use seals::{RgbSeal, RgbSealDef};
 pub use single_use_seals::*;
 pub use verify::{ContractApi, ContractVerify, OperationSeals, ReadOperation, VerificationError};
+#[cfg(feature = "parallel")]
+pub use verify::ParallelVerifyMemory;
 
 /// Strict type library name for all RGB-related types.
 pub const LIB_NAME_RGB: &str = "RGB";
