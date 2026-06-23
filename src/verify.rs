@@ -349,9 +349,6 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
     ) -> Result<(), VerificationError<Seal>>
     where
         Self: Sized + ParallelVerifyMemory,
-        Seal: Send + Sync,
-        Seal::Definition: Send + Sync,
-        SealWitness<Seal>: Clone + Sync,
     {
         use rayon::prelude::*;
 
@@ -437,14 +434,16 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         }
 
         // Per-op work carried from the serial pre-pass into parallel verify and serial apply.
+        // Side-effecting material for the serial apply phase. The operation itself is NOT kept
+        // here: it goes into a separate `Vec<Option<Operation>>` consumed by the parallel verify,
+        // so the parallel iterator never borrows `Prep` (hence no `SealWitness: Sync` requirement)
+        // and the only thread-shared values are `Operation` + the `Sync` verify context.
         struct Prep<Seal: RgbSeal> {
             idx: usize,
             opid: Opid,
-            operation: Operation,
             defined_seals: SmallOrdMap<u16, Seal::Definition>,
             witness: Option<SealWitness<Seal>>,
             closed_seals: Vec<Seal>,
-            known: bool,
             witness_known: bool,
         }
 
@@ -453,6 +452,8 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         for layer in layers {
             // (a) Serial pre-pass: known checks, subset validation, gather closed seals.
             let mut preps = Vec::<Prep<Seal>>::new();
+            // Aligned 1:1 with `preps`: the operation to AluVM-verify (`None` for a known op).
+            let mut verify_jobs = Vec::<Option<Operation>>::new();
             for &i in &layer {
                 let opid = opids[i];
                 let known = self.is_known(opid);
@@ -516,14 +517,15 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     }
                 }
 
+                // All immutable borrows of `blocks[i]` above have ended; move the owned pieces out
+                // (take instead of clone) so the parallel/apply phases need no extra `Clone` bound.
+                verify_jobs.push((!known).then(|| blocks[i].operation.clone()));
                 preps.push(Prep {
                     idx: i,
                     opid,
-                    operation: blocks[i].operation.clone(),
-                    defined_seals: blocks[i].defined_seals.clone(),
-                    witness: blocks[i].witness.clone(),
+                    defined_seals: core::mem::take(&mut blocks[i].defined_seals),
+                    witness: blocks[i].witness.take(),
                     closed_seals,
-                    known,
                     witness_known,
                 });
             }
@@ -537,15 +539,9 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // the mutable/DB parts of `self` stay untouched until the serial apply below.
             let codex = self.codex();
             let ctx = self.verify_context();
-            let verified: Vec<Option<Result<VerifiedOperation, CallError>>> = preps
-                .par_iter()
-                .map(|prep| {
-                    if prep.known {
-                        None
-                    } else {
-                        Some(codex.verify(contract_id, prep.operation.clone(), &ctx, &ctx))
-                    }
-                })
+            let verified: Vec<Option<Result<VerifiedOperation, CallError>>> = verify_jobs
+                .into_par_iter()
+                .map(|job| job.map(|operation| codex.verify(contract_id, operation, &ctx, &ctx)))
                 .collect();
             drop(ctx);
 
