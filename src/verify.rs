@@ -284,10 +284,30 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         let mut is_genesis = true;
         let mut seals = BTreeMap::<CellAddr, Seal>::new();
 
+        // P0 diagnostics (feature `verify-diagnostics`, off by default): cheap
+        // per-`evaluate` counters with no graph construction. Layer-width
+        // distribution is collected separately in `evaluate_parallel` (which
+        // already builds the Kahn layering). These bound Plan A's ROI: how many
+        // ops actually run AluVM + seal-closing vs. are skipped as known.
+        #[cfg(feature = "verify-diagnostics")]
+        let diag_started_at = std::time::Instant::now();
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_total_ops = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_known_skipped = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_verified_ops = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_verify_ns = 0u128;
+
         while let Some(mut block) = reader
             .read_operation()
             .map_err(|e| VerificationError::Stream(Box::new(e)))?
         {
+            #[cfg(feature = "verify-diagnostics")]
+            {
+                diag_total_ops += 1;
+            }
             // Genesis cannot commit to the contract id since the contract does not exist yet;
             // thus, we have to apply this little trick
             if is_genesis {
@@ -309,6 +329,10 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             };
 
             if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+                #[cfg(feature = "verify-diagnostics")]
+                {
+                    diag_known_skipped += 1;
+                }
                 if !seals.is_empty() {
                     for input in &block.operation.destructible_in {
                         seals.remove(&input.addr);
@@ -370,9 +394,16 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 None
             } else {
                 // Verify the operation
+                #[cfg(feature = "verify-diagnostics")]
+                let verify_started_at = std::time::Instant::now();
                 let verified = self
                     .codex()
                     .verify(contract_id, block.operation, self.memory(), self.repo())?;
+                #[cfg(feature = "verify-diagnostics")]
+                {
+                    diag_verify_ns += verify_started_at.elapsed().as_nanos();
+                    diag_verified_ops += 1;
+                }
                 Some(verified)
             };
 
@@ -418,6 +449,22 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             if !block.defined_seals.is_empty() {
                 self.apply_seals(opid, block.defined_seals);
             }
+        }
+
+        #[cfg(feature = "verify-diagnostics")]
+        {
+            let total_us = diag_started_at.elapsed().as_micros();
+            let verify_us = diag_verify_ns / 1_000;
+            let avg_verify_us = if diag_verified_ops > 0 {
+                verify_us / diag_verified_ops as u128
+            } else {
+                0
+            };
+            eprintln!(
+                "rgb_verify_diag path=serial contract_id={contract_id} total_ops={diag_total_ops} \
+known_skipped={diag_known_skipped} verified_ops={diag_verified_ops} \
+verify_us={verify_us} avg_verify_us={avg_verify_us} total_us={total_us}"
+            );
         }
 
         Ok(())
@@ -478,6 +525,27 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             .map(|b| b.operation.opid())
             .collect::<Vec<_>>();
         let layers = operation_dependency_layers(&blocks);
+
+        // P0 diagnostics (feature `verify-diagnostics`, off by default): layer-width
+        // distribution from the Kahn layering this path already builds. This is the
+        // primary signal for Plan A's ROI ceiling: a deep+wide DAG approaches
+        // core-count speedup, while a narrow chain (max width ~1) gains little.
+        #[cfg(feature = "verify-diagnostics")]
+        {
+            let layer_count = layers.len();
+            let max_width = layers.iter().map(|l| l.len()).max().unwrap_or(0);
+            let total_ops = blocks.len();
+            let avg_width = if layer_count > 0 {
+                total_ops as f64 / layer_count as f64
+            } else {
+                0.0
+            };
+            let wide_layers = layers.iter().filter(|l| l.len() > 1).count();
+            eprintln!(
+                "rgb_verify_diag path=parallel contract_id={contract_id} total_ops={total_ops} \
+layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers={wide_layers}"
+            );
+        }
 
         // Per-op work carried from the serial pre-pass into parallel verify and serial apply.
         // Side-effecting material for the serial apply phase. The operation itself is NOT kept

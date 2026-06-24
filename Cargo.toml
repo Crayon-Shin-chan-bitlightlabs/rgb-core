@@ -37,6 +37,11 @@ std = []
 # `evaluate` path is unchanged. Requires std.
 parallel = ["std", "dep:rayon"]
 
+# Diagnostics-only (P0): emit verify op-count / timing metrics from the serial
+# `evaluate` (and layer-width metrics from `evaluate_parallel`) via eprintln. Off
+# by default; pure observation, no semantic change, no extra runtime dependency.
+verify-diagnostics = ["std"]
+
 bitcoin = ["bp-core"]
 liquid = ["bp-core"]
 prime = []
