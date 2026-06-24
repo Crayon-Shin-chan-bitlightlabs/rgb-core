@@ -66,6 +66,13 @@ pub trait RgbSealDef: Clone + Eq + Debug + Display + StrictDumb + StrictEncode +
 /// A type which serves as a single-use seal protocol implementation for RGB contracts.
 pub trait RgbSeal:
     SingleUseSeal<Message: From<[u8; 32]>, PubWitness = Self::Published, CliWitness = Self::Client> + Ord
+where
+    Self: Send,
+    Self::Published: Send,
+    Self::Client: Send,
+    Self::WitnessId: Send,
+    <Self::Published as PublishedWitness<Self>>::Error: Send,
+    <Self::Client as ClientSideWitness>::Error: Send,
 {
     /// A type providing corresponding single-use seal definitions.
     type Definition: RgbSealDef<Src = Self>;

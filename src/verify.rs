@@ -29,6 +29,8 @@ use core::fmt::{Debug, Formatter};
 
 use amplify::confinement::SmallOrdMap;
 use amplify::ByteArray;
+#[cfg(feature = "parallel")]
+use single_use_seals::ClientSideWitness;
 use single_use_seals::{PublishedWitness, SealError, SealWitness};
 use ultrasonic::{
     AuthToken, CallError, CellAddr, Codex, ContractId, LibRepo, Memory, Operation, Opid, VerifiedOperation,
@@ -435,14 +437,18 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
     /// serial `evaluate` remains the authority; this path is off by default.
     ///
     /// Faults are collected across all layers (not short-circuited) and the earliest in stream
-    /// order is returned, matching the serial `evaluate` for invalid consignments too. Seal closing
-    /// stays on the serial apply path (its `SealError` witness-error associated types are not
-    /// `Send`, so it is never carried across rayon).
+    /// order is returned, matching the serial `evaluate` for invalid consignments too.
     #[cfg(feature = "parallel")]
     #[allow(clippy::result_large_err)]
     fn evaluate_parallel<R: ReadOperation<Seal = Seal>>(&mut self, mut reader: R) -> Result<(), VerificationError<Seal>>
     where
         Self: Sized + ParallelVerifyMemory,
+        Seal: Send,
+        Seal::PubWitness: Send,
+        Seal::CliWitness: Send,
+        <Seal::PubWitness as PublishedWitness<Seal>>::PubId: Send,
+        <Seal::PubWitness as PublishedWitness<Seal>>::Error: Send,
+        <Seal::CliWitness as ClientSideWitness>::Error: Send,
     {
         use rayon::prelude::*;
 
@@ -485,7 +491,13 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             idx: usize,
             opid: Opid,
             defined_seals: SmallOrdMap<u16, Seal::Definition>,
-            witness: Option<SealWitness<Seal>>,
+            witness_known: bool,
+            has_closed_seals: bool,
+        }
+
+        struct SealClosingJob<Seal: RgbSeal> {
+            opid: Opid,
+            witness: SealWitness<Seal>,
             closed_seals: Vec<Seal>,
             witness_known: bool,
         }
@@ -500,6 +512,8 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             let mut preps = Vec::<Prep<Seal>>::new();
             // Aligned 1:1 with `preps`: the operation to AluVM-verify (`None` for a known op).
             let mut verify_jobs = Vec::<Option<Operation>>::new();
+            // Aligned 1:1 with `preps`: the witness/seal-closing work for this op, when present.
+            let mut seal_jobs = Vec::<Option<SealClosingJob<Seal>>>::new();
             for &i in &layer {
                 let opid = opids[i];
                 let known = self.is_known(opid);
@@ -556,7 +570,10 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     }
                 } else {
                     for input in &blocks[i].operation.destructible_in {
-                        match seals.remove(&input.addr).or_else(|| self.known_seal(input.addr)) {
+                        match seals
+                            .remove(&input.addr)
+                            .or_else(|| self.known_seal(input.addr))
+                        {
                             Some(seal) => closed_seals.push(seal),
                             None => {
                                 seal_unknown = Some(input.addr);
@@ -573,33 +590,60 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 // All immutable borrows of `blocks[i]` above have ended; move the owned pieces out
                 // (take instead of clone) so the parallel/apply phases need no extra `Clone` bound.
                 verify_jobs.push((!known).then(|| blocks[i].operation.clone()));
+                let has_closed_seals = !closed_seals.is_empty();
+                seal_jobs.push(blocks[i].witness.take().map(|witness| SealClosingJob {
+                    opid,
+                    witness,
+                    closed_seals,
+                    witness_known,
+                }));
                 preps.push(Prep {
                     idx: i,
                     opid,
                     defined_seals: core::mem::take(&mut blocks[i].defined_seals),
-                    witness: blocks[i].witness.take(),
-                    closed_seals,
                     witness_known,
+                    has_closed_seals,
                 });
             }
 
-            // (b) Parallel verify (read-only on self): the AluVM script + lock script — the
-            //     dominant per-op CPU cost. Single-use-seal closing stays in the serial apply
-            //     phase below to avoid plumbing the seal `SealError` (whose witness-error
-            //     associated types are not `Send`) across rayon worker threads.
+            // (b) Parallel verification. AluVM script verification borrows only the read-only
+            // context; single-use seal closing owns its witness job and returns it for serial apply.
             // A `Sync` read-only verification context borrowed from `&self` is what allows a
             // non-`Sync` contract to verify in parallel: rayon shares `&ctx` across threads while
             // the mutable/DB parts of `self` stay untouched until the serial apply below.
             let codex = self.codex();
             let ctx = self.verify_context();
-            let verified: Vec<Option<Result<VerifiedOperation, CallError>>> = verify_jobs
-                .into_par_iter()
-                .map(|job| job.map(|operation| codex.verify(contract_id, operation, &ctx, &ctx)))
-                .collect();
+            let (verified, seal_results) = rayon::join(
+                || {
+                    verify_jobs
+                        .into_par_iter()
+                        .map(|job| job.map(|operation| codex.verify(contract_id, operation, &ctx, &ctx)))
+                        .collect::<Vec<_>>()
+                },
+                || {
+                    seal_jobs
+                        .into_par_iter()
+                        .map(|job| {
+                            job.map(|job| {
+                                let pub_id = job.witness.published.pub_id();
+                                let err = if job.witness_known {
+                                    None
+                                } else {
+                                    let msg = job.opid.to_byte_array();
+                                    job.witness
+                                        .verify_seals_closing(&job.closed_seals, msg.into())
+                                        .err()
+                                };
+                                (job.witness, pub_id, err)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
             drop(ctx);
 
             // (c) Serial apply in topological (stream) order: seal closing + side effects.
-            for (prep, op_result) in preps.into_iter().zip(verified) {
+            for ((prep, op_result), seal_result) in preps.into_iter().zip(verified).zip(seal_results) {
                 let opid = prep.opid;
                 let operation = match op_result {
                     Some(Ok(verified)) => Some(verified),
@@ -610,16 +654,14 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     None => None,
                 };
 
-                if let Some(witness) = prep.witness {
-                    let pub_id = witness.published.pub_id();
+                if let Some((witness, pub_id, seal_err)) = seal_result {
                     for (pos, seal) in prep.defined_seals.iter() {
                         let addr = CellAddr::new(opid, *pos);
                         let seal = seal.to_src().unwrap_or_else(|| seal.resolve(pub_id));
                         seals.insert(addr, seal);
                     }
                     if !prep.witness_known {
-                        let msg = opid.to_byte_array();
-                        if let Err(err) = witness.verify_seals_closing(&prep.closed_seals, msg.into()) {
+                        if let Some(err) = seal_err {
                             record_earliest_fault(
                                 &mut earliest_fault,
                                 prep.idx,
@@ -635,7 +677,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                             seals.insert(CellAddr::new(opid, *pos), seal);
                         }
                     }
-                    if !prep.closed_seals.is_empty() {
+                    if prep.has_closed_seals {
                         record_earliest_fault(&mut earliest_fault, prep.idx, VerificationError::NoWitness(opid));
                         continue;
                     }
@@ -1023,6 +1065,29 @@ mod test {
         assert_serial_parallel_equiv(TestReader::new(vec![
             OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
             OperationSeals { operation, defined_seals: none!(), witness: None },
+        ]));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_equiv_seal_closing_error() {
+        // A provided but invalid witness exercises the parallel seal-closing job and must still
+        // report the same error as serial evaluation.
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let operation = operation();
+
+        assert_serial_parallel_equiv(TestReader::new(vec![
+            OperationSeals {
+                operation: genesis_op,
+                defined_seals: small_bmap! { 0 => SEAL_1 },
+                witness: None,
+            },
+            OperationSeals {
+                operation,
+                defined_seals: none!(),
+                witness: Some(SealWitness::new(strict_dumb!(), strict_dumb!())),
+            },
         ]));
     }
 
