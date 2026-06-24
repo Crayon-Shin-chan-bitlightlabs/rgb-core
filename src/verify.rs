@@ -181,6 +181,26 @@ pub trait ParallelVerifyMemory {
     fn verify_context(&self) -> Self::Ctx<'_>;
 }
 
+/// Runtime switch for Plan A layer-width diagnostics, cached once. Enabled when
+/// `RGB_PARALLEL_VERIFY_DIAG` is `1`/`true`/`on`. Off by default; emits one
+/// `rgb_verify_diag` line per parallel consume so a run already on the parallel
+/// path can measure DAG layer width without a separate diagnostics build.
+#[cfg(feature = "parallel")]
+fn parallel_verify_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RGB_PARALLEL_VERIFY_DIAG")
+            .map(|value| {
+                let value = value.trim();
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(feature = "parallel")]
 fn operation_dependency_layers<Seal: RgbSeal>(blocks: &[OperationSeals<Seal>]) -> Vec<Vec<usize>> {
     // Opids + opid -> stream index.
@@ -526,12 +546,13 @@ verify_us={verify_us} avg_verify_us={avg_verify_us} total_us={total_us}"
             .collect::<Vec<_>>();
         let layers = operation_dependency_layers(&blocks);
 
-        // P0 diagnostics (feature `verify-diagnostics`, off by default): layer-width
-        // distribution from the Kahn layering this path already builds. This is the
-        // primary signal for Plan A's ROI ceiling: a deep+wide DAG approaches
-        // core-count speedup, while a narrow chain (max width ~1) gains little.
-        #[cfg(feature = "verify-diagnostics")]
-        {
+        // Plan A layer-width diagnostics. Gated at runtime by `RGB_PARALLEL_VERIFY_DIAG`
+        // (cached once) rather than a compile feature, so a run that already enables the
+        // parallel path via `RGB_PARALLEL_VERIFY` can also surface the Kahn layer-width
+        // distribution without a separate diagnostics build. This is the primary signal
+        // for Plan A's ROI ceiling: a deep+wide DAG approaches core-count speedup, while a
+        // narrow chain (max width ~1) gains little. One line per consume; off by default.
+        if parallel_verify_diag_enabled() {
             let layer_count = layers.len();
             let max_width = layers.iter().map(|l| l.len()).max().unwrap_or(0);
             let total_ops = blocks.len();
