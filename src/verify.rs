@@ -193,12 +193,20 @@ fn parallel_verify_diag_enabled() -> bool {
         std::env::var("RGB_PARALLEL_VERIFY_DIAG")
             .map(|value| {
                 let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
+                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
             })
             .unwrap_or(false)
     })
+}
+
+#[cfg(feature = "verify-diagnostics")]
+fn verify_diag_enabled() -> bool {
+    true
+}
+
+#[cfg(all(not(feature = "verify-diagnostics"), feature = "parallel"))]
+fn verify_diag_enabled() -> bool {
+    parallel_verify_diag_enabled()
 }
 
 #[cfg(feature = "parallel")]
@@ -304,28 +312,36 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         let mut is_genesis = true;
         let mut seals = BTreeMap::<CellAddr, Seal>::new();
 
-        // P0 diagnostics (feature `verify-diagnostics`, off by default): cheap
-        // per-`evaluate` counters with no graph construction. Layer-width
-        // distribution is collected separately in `evaluate_parallel` (which
-        // already builds the Kahn layering). These bound Plan A's ROI: how many
-        // ops actually run AluVM + seal-closing vs. are skipped as known.
-        #[cfg(feature = "verify-diagnostics")]
+        // P0 diagnostics: cheap per-`evaluate` counters with no graph
+        // construction. `verify-diagnostics` keeps the old always-on behavior;
+        // normal parallel builds can enable the same line at runtime with
+        // `RGB_PARALLEL_VERIFY_DIAG=1`, which lets chaos-test collect serial
+        // baselines without a separate diagnostics build.
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let diag_enabled = verify_diag_enabled();
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
         let diag_started_at = std::time::Instant::now();
-        #[cfg(feature = "verify-diagnostics")]
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
         let mut diag_total_ops = 0usize;
-        #[cfg(feature = "verify-diagnostics")]
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
         let mut diag_known_skipped = 0usize;
-        #[cfg(feature = "verify-diagnostics")]
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
         let mut diag_verified_ops = 0usize;
-        #[cfg(feature = "verify-diagnostics")]
-        let mut diag_verify_ns = 0u128;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_alu_verify_ns = 0u128;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_seal_close_ops = 0usize;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_closed_seals = 0usize;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_seal_close_ns = 0u128;
 
         while let Some(mut block) = reader
             .read_operation()
             .map_err(|e| VerificationError::Stream(Box::new(e)))?
         {
-            #[cfg(feature = "verify-diagnostics")]
-            {
+            #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+            if diag_enabled {
                 diag_total_ops += 1;
             }
             // Genesis cannot commit to the contract id since the contract does not exist yet;
@@ -349,8 +365,8 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             };
 
             if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
-                #[cfg(feature = "verify-diagnostics")]
-                {
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                if diag_enabled {
                     diag_known_skipped += 1;
                 }
                 if !seals.is_empty() {
@@ -414,14 +430,14 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 None
             } else {
                 // Verify the operation
-                #[cfg(feature = "verify-diagnostics")]
-                let verify_started_at = std::time::Instant::now();
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                let verify_started_at = diag_enabled.then(std::time::Instant::now);
                 let verified = self
                     .codex()
                     .verify(contract_id, block.operation, self.memory(), self.repo())?;
-                #[cfg(feature = "verify-diagnostics")]
-                {
-                    diag_verify_ns += verify_started_at.elapsed().as_nanos();
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                if let Some(verify_started_at) = verify_started_at {
+                    diag_alu_verify_ns += verify_started_at.elapsed().as_nanos();
                     diag_verified_ops += 1;
                 }
                 Some(verified)
@@ -442,9 +458,17 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
                 if !witness_known {
                     let msg = opid.to_byte_array();
+                    #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                    let seal_close_started_at = diag_enabled.then(std::time::Instant::now);
                     witness
                         .verify_seals_closing(&closed_seals, msg.into())
                         .map_err(|e| VerificationError::SealsNotClosed(pub_id, opid, e))?;
+                    #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                    if let Some(seal_close_started_at) = seal_close_started_at {
+                        diag_seal_close_ns += seal_close_started_at.elapsed().as_nanos();
+                        diag_seal_close_ops += 1;
+                        diag_closed_seals += closed_seals.len();
+                    }
 
                     self.apply_witness(opid, witness);
                 }
@@ -471,19 +495,21 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             }
         }
 
-        #[cfg(feature = "verify-diagnostics")]
-        {
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        if diag_enabled {
             let total_us = diag_started_at.elapsed().as_micros();
-            let verify_us = diag_verify_ns / 1_000;
-            let avg_verify_us = if diag_verified_ops > 0 {
-                verify_us / diag_verified_ops as u128
-            } else {
-                0
-            };
+            let alu_verify_us = diag_alu_verify_ns / 1_000;
+            let avg_alu_verify_us = if diag_verified_ops > 0 { alu_verify_us / diag_verified_ops as u128 } else { 0 };
+            let seal_close_us = diag_seal_close_ns / 1_000;
+            let avg_seal_close_us =
+                if diag_seal_close_ops > 0 { seal_close_us / diag_seal_close_ops as u128 } else { 0 };
             eprintln!(
                 "rgb_verify_diag path=serial contract_id={contract_id} total_ops={diag_total_ops} \
 known_skipped={diag_known_skipped} verified_ops={diag_verified_ops} \
-verify_us={verify_us} avg_verify_us={avg_verify_us} total_us={total_us}"
+verify_us={alu_verify_us} avg_verify_us={avg_alu_verify_us} \
+alu_verify_us={alu_verify_us} avg_alu_verify_us={avg_alu_verify_us} \
+seal_close_ops={diag_seal_close_ops} closed_seals={diag_closed_seals} \
+seal_close_us={seal_close_us} avg_seal_close_us={avg_seal_close_us} total_us={total_us}"
             );
         }
 
@@ -552,21 +578,28 @@ verify_us={verify_us} avg_verify_us={avg_verify_us} total_us={total_us}"
         // distribution without a separate diagnostics build. This is the primary signal
         // for Plan A's ROI ceiling: a deep+wide DAG approaches core-count speedup, while a
         // narrow chain (max width ~1) gains little. One line per consume; off by default.
-        if parallel_verify_diag_enabled() {
+        let diag_enabled = parallel_verify_diag_enabled();
+        let mut diag_verified_ops = 0usize;
+        let mut diag_known_skipped = 0usize;
+        let mut diag_alu_verify_ns = 0u128;
+        let mut diag_seal_close_ops = 0usize;
+        let mut diag_closed_seals = 0usize;
+        let mut diag_seal_close_ns = 0u128;
+        if diag_enabled {
             let layer_count = layers.len();
             let max_width = layers.iter().map(|l| l.len()).max().unwrap_or(0);
             let total_ops = blocks.len();
-            let avg_width = if layer_count > 0 {
-                total_ops as f64 / layer_count as f64
-            } else {
-                0.0
-            };
+            let avg_width = if layer_count > 0 { total_ops as f64 / layer_count as f64 } else { 0.0 };
             let wide_layers = layers.iter().filter(|l| l.len() > 1).count();
             eprintln!(
-                "rgb_verify_diag path=parallel contract_id={contract_id} total_ops={total_ops} \
+                "rgb_verify_diag path=parallel kind=layout contract_id={contract_id} total_ops={total_ops} \
 layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers={wide_layers}"
             );
         }
+        // Wall-clock span for the timing line below. Started after the layout line so its
+        // formatting/IO is excluded, and covers layering-driven verify + serial apply — the
+        // span that lines up with the serial path's `total_us` for ROI comparison.
+        let diag_started_at = diag_enabled.then(std::time::Instant::now);
 
         // Per-op work carried from the serial pre-pass into parallel verify and serial apply.
         // Side-effecting material for the serial apply phase. The operation itself is NOT kept
@@ -617,6 +650,9 @@ layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers=
             for &i in &layer {
                 let opid = opids[i];
                 let known = self.is_known(opid);
+                if diag_enabled && known {
+                    diag_known_skipped += 1;
+                }
                 let witness_known = match blocks[i].witness.as_ref() {
                     Some(witness) if known => self.is_witness_known(opid, witness),
                     _ => false,
@@ -728,7 +764,16 @@ layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers=
                 || {
                     verify_jobs
                         .into_par_iter()
-                        .map(|job| job.map(|operation| codex.verify(contract_id, operation, &ctx, &ctx)))
+                        .map(|job| {
+                            job.map(|operation| {
+                                let verify_started_at = diag_enabled.then(std::time::Instant::now);
+                                let result = codex.verify(contract_id, operation, &ctx, &ctx);
+                                let verify_ns = verify_started_at
+                                    .map(|started_at| started_at.elapsed().as_nanos())
+                                    .unwrap_or(0);
+                                (result, verify_ns)
+                            })
+                        })
                         .collect::<Vec<_>>()
                 },
                 || {
@@ -737,15 +782,22 @@ layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers=
                         .map(|job| {
                             job.map(|job| {
                                 let pub_id = job.witness.published.pub_id();
-                                let err = if job.witness_known {
-                                    None
+                                let closed_seals = job.closed_seals.len();
+                                let (err, seal_close_ns) = if job.witness_known {
+                                    (None, 0)
                                 } else {
                                     let msg = job.opid.to_byte_array();
-                                    job.witness
+                                    let seal_close_started_at = diag_enabled.then(std::time::Instant::now);
+                                    let err = job
+                                        .witness
                                         .verify_seals_closing(&job.closed_seals, msg.into())
-                                        .err()
+                                        .err();
+                                    let seal_close_ns = seal_close_started_at
+                                        .map(|started_at| started_at.elapsed().as_nanos())
+                                        .unwrap_or(0);
+                                    (err, seal_close_ns)
                                 };
-                                (job.witness, pub_id, err)
+                                (job.witness, pub_id, err, seal_close_ns, closed_seals, !job.witness_known)
                             })
                         })
                         .collect::<Vec<_>>()
@@ -758,15 +810,30 @@ layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers=
             for ((prep, op_result), seal_result) in preps.into_iter().zip(verified).zip(seal_results) {
                 let opid = prep.opid;
                 let operation = match op_result {
-                    Some(Ok(verified)) => Some(verified),
-                    Some(Err(err)) => {
-                        layer_ready.push((prep.idx, Ready::Fault(Box::new(err.into()))));
-                        continue;
+                    Some((result, verify_ns)) => {
+                        if diag_enabled {
+                            diag_alu_verify_ns += verify_ns;
+                            diag_verified_ops += 1;
+                        }
+                        match result {
+                            Ok(verified) => Some(verified),
+                            Err(err) => {
+                                layer_ready.push((prep.idx, Ready::Fault(Box::new(err.into()))));
+                                continue;
+                            }
+                        }
                     }
                     None => None,
                 };
 
-                let seal = if let Some((witness, pub_id, seal_err)) = seal_result {
+                let seal = if let Some((witness, pub_id, seal_err, seal_close_ns, closed_seals, seal_close_checked)) =
+                    seal_result
+                {
+                    if diag_enabled && seal_close_checked {
+                        diag_seal_close_ns += seal_close_ns;
+                        diag_seal_close_ops += 1;
+                        diag_closed_seals += closed_seals;
+                    }
                     if !prep.witness_known {
                         if let Some(err) = seal_err {
                             layer_ready.push((
@@ -847,6 +914,23 @@ layers={layer_count} max_width={max_width} avg_width={avg_width:.2} wide_layers=
                 }
                 next_apply_idx += 1;
             }
+        }
+        if diag_enabled {
+            let total_us = diag_started_at.map(|started_at| started_at.elapsed().as_micros()).unwrap_or(0);
+            let alu_verify_us = diag_alu_verify_ns / 1_000;
+            let avg_alu_verify_us = if diag_verified_ops > 0 { alu_verify_us / diag_verified_ops as u128 } else { 0 };
+            let seal_close_us = diag_seal_close_ns / 1_000;
+            let avg_seal_close_us =
+                if diag_seal_close_ops > 0 { seal_close_us / diag_seal_close_ops as u128 } else { 0 };
+            eprintln!(
+                "rgb_verify_diag path=parallel kind=timing contract_id={contract_id} total_ops={} \
+known_skipped={diag_known_skipped} verified_ops={diag_verified_ops} \
+verify_us={alu_verify_us} avg_verify_us={avg_alu_verify_us} \
+alu_verify_us={alu_verify_us} avg_alu_verify_us={avg_alu_verify_us} \
+seal_close_ops={diag_seal_close_ops} closed_seals={diag_closed_seals} \
+seal_close_us={seal_close_us} avg_seal_close_us={avg_seal_close_us} total_us={total_us}",
+                blocks.len()
+            );
         }
         Ok(())
     }
