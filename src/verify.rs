@@ -255,21 +255,6 @@ fn operation_dependency_layers<Seal: RgbSeal>(blocks: &[OperationSeals<Seal>]) -
     layers
 }
 
-/// Record `err` as the fault to report iff it occurs at an earlier stream index than any fault
-/// already seen. `evaluate_parallel` collects faults across all layers instead of short-circuiting,
-/// then returns the earliest in stream order — the same error the serial `evaluate` returns (it
-/// stops at the first faulting operation in stream order).
-#[cfg(feature = "parallel")]
-fn record_earliest_fault<Seal: RgbSeal>(
-    slot: &mut Option<(usize, VerificationError<Seal>)>,
-    idx: usize,
-    err: VerificationError<Seal>,
-) {
-    if slot.as_ref().map_or(true, |(seen, _)| idx < *seen) {
-        *slot = Some((idx, err));
-    }
-}
-
 /// Main implementation of the contract verification procedure.
 ///
 /// # Nota bene
@@ -436,8 +421,9 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
     /// side-effecting apply (`seals` map + `apply_*`) runs serially in topological order. The
     /// serial `evaluate` remains the authority; this path is off by default.
     ///
-    /// Faults are collected across all layers (not short-circuited) and the earliest in stream
-    /// order is returned, matching the serial `evaluate` for invalid consignments too.
+    /// Faults are queued by stream index and returned only when they become the next stream item to
+    /// apply. This preserves serial error order without applying independent later operations after
+    /// an earlier stream item fails.
     #[cfg(feature = "parallel")]
     #[allow(clippy::result_large_err)]
     fn evaluate_parallel<R: ReadOperation<Seal = Seal>>(&mut self, mut reader: R) -> Result<(), VerificationError<Seal>>
@@ -491,6 +477,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             idx: usize,
             opid: Opid,
             defined_seals: SmallOrdMap<u16, Seal::Definition>,
+            destructible_inputs: Vec<CellAddr>,
             witness_known: bool,
             has_closed_seals: bool,
         }
@@ -502,13 +489,26 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             witness_known: bool,
         }
 
-        let mut seals = BTreeMap::<CellAddr, Seal>::new();
-        // Faults are collected (not short-circuited) so the earliest in stream order can be
-        // returned, matching the serial `evaluate`.
-        let mut earliest_fault: Option<(usize, VerificationError<Seal>)> = None;
+        type PubId<Seal> = <<Seal as single_use_seals::SingleUseSeal>::PubWitness as PublishedWitness<Seal>>::PubId;
 
+        struct Apply<Seal: RgbSeal> {
+            prep: Prep<Seal>,
+            operation: Option<VerifiedOperation>,
+            seal: Option<(SealWitness<Seal>, PubId<Seal>)>,
+        }
+
+        enum Ready<Seal: RgbSeal> {
+            Apply(Box<Apply<Seal>>),
+            Fault(Box<VerificationError<Seal>>),
+            Skip { destructible_inputs: Vec<CellAddr> },
+        }
+
+        let mut seals = BTreeMap::<CellAddr, Seal>::new();
+        let mut ready = BTreeMap::<usize, Ready<Seal>>::new();
+        let mut next_apply_idx = 0usize;
         for layer in layers {
             // (a) Serial pre-pass: known checks, subset validation, gather closed seals.
+            let mut layer_ready = Vec::<(usize, Ready<Seal>)>::new();
             let mut preps = Vec::<Prep<Seal>>::new();
             // Aligned 1:1 with `preps`: the operation to AluVM-verify (`None` for a known op).
             let mut verify_jobs = Vec::<Option<Operation>>::new();
@@ -523,9 +523,13 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 };
 
                 if known && witness_known && self.are_seals_known(opid, &blocks[i].defined_seals) {
-                    for input in &blocks[i].operation.destructible_in {
-                        seals.remove(&input.addr);
-                    }
+                    let destructible_inputs = blocks[i]
+                        .operation
+                        .destructible_in
+                        .iter()
+                        .map(|input| input.addr)
+                        .collect();
+                    layer_ready.push((i, Ready::Skip { destructible_inputs }));
                     continue;
                 }
 
@@ -554,24 +558,25 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         .iter()
                         .map(|(pos, seal)| (*pos, seal.to_string()))
                         .collect();
-                    record_earliest_fault(
-                        &mut earliest_fault,
+                    layer_ready.push((
                         i,
-                        VerificationError::SealsDefinitionMismatch { opid, reported, defined, sources },
-                    );
+                        Ready::Fault(Box::new(VerificationError::SealsDefinitionMismatch {
+                            opid,
+                            reported,
+                            defined,
+                            sources,
+                        })),
+                    ));
                     continue;
                 }
 
                 let mut closed_seals = Vec::<Seal>::new();
                 let mut seal_unknown = None;
-                if witness_known {
-                    for input in &blocks[i].operation.destructible_in {
-                        seals.remove(&input.addr);
-                    }
-                } else {
+                if !witness_known {
                     for input in &blocks[i].operation.destructible_in {
                         match seals
-                            .remove(&input.addr)
+                            .get(&input.addr)
+                            .cloned()
                             .or_else(|| self.known_seal(input.addr))
                         {
                             Some(seal) => closed_seals.push(seal),
@@ -583,7 +588,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     }
                 }
                 if let Some(addr) = seal_unknown {
-                    record_earliest_fault(&mut earliest_fault, i, VerificationError::SealUnknown(addr));
+                    layer_ready.push((i, Ready::Fault(Box::new(VerificationError::SealUnknown(addr)))));
                     continue;
                 }
 
@@ -601,6 +606,12 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     idx: i,
                     opid,
                     defined_seals: core::mem::take(&mut blocks[i].defined_seals),
+                    destructible_inputs: blocks[i]
+                        .operation
+                        .destructible_in
+                        .iter()
+                        .map(|input| input.addr)
+                        .collect(),
                     witness_known,
                     has_closed_seals,
                 });
@@ -642,33 +653,76 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             );
             drop(ctx);
 
-            // (c) Serial apply in topological (stream) order: seal closing + side effects.
+            // (c) Convert same-layer results into stream-indexed ready items. Faults are queued
+            // alongside successful operations, so the drain below can preserve serial error order.
             for ((prep, op_result), seal_result) in preps.into_iter().zip(verified).zip(seal_results) {
                 let opid = prep.opid;
                 let operation = match op_result {
                     Some(Ok(verified)) => Some(verified),
                     Some(Err(err)) => {
-                        record_earliest_fault(&mut earliest_fault, prep.idx, err.into());
+                        layer_ready.push((prep.idx, Ready::Fault(Box::new(err.into()))));
                         continue;
                     }
                     None => None,
                 };
 
-                if let Some((witness, pub_id, seal_err)) = seal_result {
+                let seal = if let Some((witness, pub_id, seal_err)) = seal_result {
+                    if !prep.witness_known {
+                        if let Some(err) = seal_err {
+                            layer_ready.push((
+                                prep.idx,
+                                Ready::Fault(Box::new(VerificationError::SealsNotClosed(pub_id, opid, err))),
+                            ));
+                            continue;
+                        } else {
+                            Some((witness, pub_id))
+                        }
+                    } else {
+                        Some((witness, pub_id))
+                    }
+                } else if prep.has_closed_seals {
+                    layer_ready.push((prep.idx, Ready::Fault(Box::new(VerificationError::NoWitness(opid)))));
+                    continue;
+                } else {
+                    None
+                };
+
+                layer_ready.push((prep.idx, Ready::Apply(Box::new(Apply { prep, operation, seal }))));
+            }
+
+            // (d) Publish successful same-layer results to the stream-order apply queue. All
+            // side-effects below are drained only as a contiguous prefix of the original stream, so
+            // independent later ops cannot mutate `self` before an earlier faulting op is known.
+            for (idx, ready_item) in layer_ready {
+                ready.insert(idx, ready_item);
+            }
+
+            while let Some(ready_item) = ready.remove(&next_apply_idx) {
+                let apply = match ready_item {
+                    Ready::Skip { destructible_inputs } => {
+                        for addr in destructible_inputs {
+                            seals.remove(&addr);
+                        }
+                        next_apply_idx += 1;
+                        continue;
+                    }
+                    Ready::Fault(err) => return Err(*err),
+                    Ready::Apply(apply) => *apply,
+                };
+
+                let Apply { prep, operation, seal } = apply;
+                let opid = prep.opid;
+                for addr in prep.destructible_inputs {
+                    seals.remove(&addr);
+                }
+
+                if let Some((witness, pub_id)) = seal {
                     for (pos, seal) in prep.defined_seals.iter() {
                         let addr = CellAddr::new(opid, *pos);
                         let seal = seal.to_src().unwrap_or_else(|| seal.resolve(pub_id));
                         seals.insert(addr, seal);
                     }
                     if !prep.witness_known {
-                        if let Some(err) = seal_err {
-                            record_earliest_fault(
-                                &mut earliest_fault,
-                                prep.idx,
-                                VerificationError::SealsNotClosed(pub_id, opid, err),
-                            );
-                            continue;
-                        }
                         self.apply_witness(opid, witness);
                     }
                 } else {
@@ -678,8 +732,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         }
                     }
                     if prep.has_closed_seals {
-                        record_earliest_fault(&mut earliest_fault, prep.idx, VerificationError::NoWitness(opid));
-                        continue;
+                        unreachable!("missing witness layer returned before apply");
                     }
                 }
 
@@ -692,11 +745,8 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                 if !prep.defined_seals.is_empty() {
                     self.apply_seals(opid, prep.defined_seals);
                 }
+                next_apply_idx += 1;
             }
-        }
-
-        if let Some((_, err)) = earliest_fault {
-            return Err(err);
         }
         Ok(())
     }
@@ -1066,6 +1116,30 @@ mod test {
             OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
             OperationSeals { operation, defined_seals: none!(), witness: None },
         ]));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_error_does_not_apply_later_ready_op() {
+        // `later` has no dependencies, so topology layering can verify it before `bad` faults.
+        // Applying through a stream-order ready queue prevents that later op from mutating contract
+        // state after the earlier stream item fails.
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let bad = operation();
+        let later = standalone_op(42, contract().contract_id);
+        let later_opid = later.opid();
+
+        let mut parallel = contract();
+        let res = parallel.evaluate_parallel(TestReader::new(vec![
+            OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+            OperationSeals { operation: bad, defined_seals: none!(), witness: None },
+            OperationSeals { operation: later, defined_seals: none!(), witness: None },
+        ]));
+
+        assert!(res.is_err());
+        assert!(!parallel.known_ops.contains_key(&later_opid));
+        assert!(!parallel.global.contains_key(&CellAddr::new(later_opid, 0)));
     }
 
     #[cfg(feature = "parallel")]
