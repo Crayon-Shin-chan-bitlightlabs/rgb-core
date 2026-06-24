@@ -229,28 +229,39 @@ fn operation_dependency_layers<Seal: RgbSeal>(blocks: &[OperationSeals<Seal>]) -
         }
     }
 
+    // Emit only stream-contiguous ready prefixes. A plain Kahn frontier may include a later
+    // producer while an earlier, deeper stream branch still blocks stream-order apply; then the
+    // next layer's pre-pass would not see the producer's seals/state. Keeping every layer anchored
+    // at the next stream index lets the apply queue drain the whole layer before the following
+    // pre-pass, without trusting consignments to be breadth-first ordered.
     let mut layers = Vec::<Vec<usize>>::new();
-    let mut frontier = (0..n).filter(|&i| indegree[i] == 0).collect::<Vec<_>>();
-    let mut emitted = 0usize;
-    while !frontier.is_empty() {
-        frontier.sort_unstable();
-        let mut next = Vec::<usize>::new();
-        for &i in &frontier {
-            emitted += 1;
+    let mut emitted = alloc::vec![false; n];
+    let mut cursor = 0usize;
+    while cursor < n {
+        let mut layer = Vec::<usize>::new();
+        if indegree[cursor] == 0 {
+            while cursor < n && indegree[cursor] == 0 {
+                layer.push(cursor);
+                cursor += 1;
+            }
+        } else {
+            // Preserve serial stream semantics for malformed or non-topological input: evaluate
+            // the blocked item in place and let the normal verifier report the first stream error.
+            layer.push(cursor);
+            cursor += 1;
+        }
+
+        for &i in &layer {
+            emitted[i] = true;
+        }
+        for &i in &layer {
             for &d in &dependents[i] {
-                indegree[d] -= 1;
-                if indegree[d] == 0 {
-                    next.push(d);
+                if !emitted[d] {
+                    indegree[d] = indegree[d].saturating_sub(1);
                 }
             }
         }
-        layers.push(frontier);
-        frontier = next;
-    }
-    // A valid consignment DAG cannot cycle; if it somehow does, fall back to one serial layer
-    // so verification still rejects it rather than silently dropping operations.
-    if emitted != n {
-        return alloc::vec![(0..n).collect::<Vec<usize>>()];
+        layers.push(layer);
     }
     layers
 }
@@ -415,11 +426,11 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
     /// Experimental topology-parallel variant of [`Self::evaluate`] (spike, feature `parallel`).
     ///
     /// Semantically equivalent to `evaluate` for accepted consignments: operations are grouped
-    /// into dependency layers (a topological partition in which same-layer operations never
-    /// consume each other's seals or read each other's applied state), each layer's read-only
-    /// verification (`Codex::verify` + `verify_seals_closing`) runs in parallel via rayon, and the
-    /// side-effecting apply (`seals` map + `apply_*`) runs serially in topological order. The
-    /// serial `evaluate` remains the authority; this path is off by default.
+    /// into stream-contiguous dependency layers in which same-layer operations never consume each
+    /// other's seals or read each other's applied state, each layer's read-only verification
+    /// (`Codex::verify` + `verify_seals_closing`) runs in parallel via rayon, and the
+    /// side-effecting apply (`seals` map + `apply_*`) runs serially in stream order. The serial
+    /// `evaluate` remains the authority; this path is off by default.
     ///
     /// Faults are queued by stream index and returned only when they become the next stream item to
     /// apply. This preserves serial error order without applying independent later operations after
@@ -1024,6 +1035,55 @@ mod test {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    fn immutable_child_op(parent: Opid, tag: u64, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: Default::default(),
+            immutable_in: small_vec![CellAddr::new(parent, 0)],
+            destructible_out: Default::default(),
+            immutable_out: small_vec![StateData::new(0u64, tag)],
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn seal_source_op(tag: u64, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: Default::default(),
+            immutable_in: Default::default(),
+            destructible_out: small_vec![StateCell {
+                data: StateValue::None,
+                auth: SEAL_1.auth_token(),
+                lock: None
+            }],
+            immutable_out: small_vec![StateData::new(0u64, tag)],
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn seal_consumer_op(source: Opid, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: small_vec![Input { addr: CellAddr::new(source, 0), witness: StateValue::None }],
+            immutable_in: Default::default(),
+            destructible_out: Default::default(),
+            immutable_out: small_vec![StateData::new(0u64, 99u64)],
+        }
+    }
+
     /// Assert that the serial `evaluate` and the parallel `evaluate_parallel` reach byte-identical
     /// ledger state on success, and the same error on failure.
     #[cfg(feature = "parallel")]
@@ -1103,6 +1163,43 @@ mod test {
         let layers = operation_dependency_layers(&ops);
 
         assert_eq!(layers, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_non_bfs_stream_sees_prior_layer_seal_producers() {
+        // The stream is a valid topological order, but not breadth-first:
+        //
+        //   genesis -> chain_1 -> chain_2 -> chain_3
+        //          \-> producer -> consumer
+        //
+        // A plain Kahn frontier would schedule `producer` with `chain_1` but stream-order apply
+        // would stall at `chain_2`, leaving `consumer` unable to see the producer seal during the
+        // next pre-pass. Stream-contiguous layers force `producer` to apply before `consumer` is
+        // prepared, so the parallel path fails like serial (`NoWitness`) instead of `SealUnknown`.
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(contract().contract_id);
+        let contract_id = contract().contract_id;
+        let chain_1 = standalone_op(11, contract_id);
+        let chain_2 = immutable_child_op(chain_1.opid(), 12, contract_id);
+        let chain_3 = immutable_child_op(chain_2.opid(), 13, contract_id);
+        let producer = seal_source_op(21, contract_id);
+        let consumer = seal_consumer_op(producer.opid(), contract_id);
+
+        let ops = vec![
+            OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+            OperationSeals { operation: chain_1, defined_seals: none!(), witness: None },
+            OperationSeals { operation: chain_2, defined_seals: none!(), witness: None },
+            OperationSeals { operation: chain_3, defined_seals: none!(), witness: None },
+            OperationSeals {
+                operation: producer,
+                defined_seals: small_bmap! { 0 => SEAL_1 },
+                witness: None,
+            },
+            OperationSeals { operation: consumer, defined_seals: none!(), witness: None },
+        ];
+        assert_eq!(operation_dependency_layers(&ops), vec![vec![0, 1], vec![2], vec![3, 4], vec![5]]);
+        assert_serial_parallel_equiv(TestReader::new(ops));
     }
 
     #[cfg(feature = "parallel")]
