@@ -26,6 +26,7 @@ ultrasonic = "0.12.0"
 bp-core = { version = "0.12.0", optional = true }
 serde = { version = "1", optional = true }
 rayon = { version = "1.10", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [features]
 default = ["std", "bitcoin"]
@@ -35,12 +36,12 @@ std = []
 
 # Experimental (spike): topology-parallel DAG verification via rayon. Off by default; the serial
 # `evaluate` path is unchanged. Requires std.
-parallel = ["std", "dep:rayon"]
+parallel = ["std", "dep:rayon", "dep:tracing"]
 
 # Diagnostics-only (P0): emit verify op-count / timing metrics from the serial
-# `evaluate` (and layer-width metrics from `evaluate_parallel`) via eprintln. Off
-# by default; pure observation, no semantic change, no extra runtime dependency.
-verify-diagnostics = ["std"]
+# `evaluate` (and layer-width metrics from `evaluate_parallel`) via tracing. Off
+# by default; pure observation, no semantic change unless the feature is enabled.
+verify-diagnostics = ["std", "dep:tracing"]
 
 bitcoin = ["bp-core"]
 liquid = ["bp-core"]
