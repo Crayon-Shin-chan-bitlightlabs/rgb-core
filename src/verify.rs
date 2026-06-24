@@ -335,11 +335,29 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         let mut diag_closed_seals = 0usize;
         #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
         let mut diag_seal_close_ns = 0u128;
+        // Residual decomposition (P0): the alu+seal split showed ~96% of `evaluate` is neither
+        // AluVM verify nor seal closing. These buckets attribute that residual across the per-op
+        // steps every op pays — stream decode, the `is_known`/witness/seals membership checks (paid
+        // by the ~89% known ops that early-`continue`), and the `apply_*` writes — so the dominant
+        // cost is identifiable without guessing.
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_read_ns = 0u128;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_known_check_ns = 0u128;
+        #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+        let mut diag_apply_ns = 0u128;
 
-        while let Some(mut block) = reader
-            .read_operation()
-            .map_err(|e| VerificationError::Stream(Box::new(e)))?
-        {
+        loop {
+            #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+            let read_started_at = diag_enabled.then(std::time::Instant::now);
+            let next = reader
+                .read_operation()
+                .map_err(|e| VerificationError::Stream(Box::new(e)))?;
+            #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+            if let Some(read_started_at) = read_started_at {
+                diag_read_ns += read_started_at.elapsed().as_nanos();
+            }
+            let Some(mut block) = next else { break };
             #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
             if diag_enabled {
                 diag_total_ops += 1;
@@ -358,13 +376,22 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // stored seal definitions were validated against this operation
             // before. Unknown or partially known aux data still falls through
             // to the normal subset and witness checks below.
+            #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+            let known_check_started_at = diag_enabled.then(std::time::Instant::now);
             let known = self.is_known(opid);
             let witness_known = match block.witness.as_ref() {
                 Some(witness) if known => self.is_witness_known(opid, witness),
                 _ => false,
             };
+            // `&&` short-circuits exactly as before: `are_seals_known` runs only when both prior
+            // checks pass. Materialized into a binding only so the membership-check span can close.
+            let fully_known = known && witness_known && self.are_seals_known(opid, &block.defined_seals);
+            #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+            if let Some(known_check_started_at) = known_check_started_at {
+                diag_known_check_ns += known_check_started_at.elapsed().as_nanos();
+            }
 
-            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+            if fully_known {
                 #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
                 if diag_enabled {
                     diag_known_skipped += 1;
@@ -470,7 +497,13 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         diag_closed_seals += closed_seals.len();
                     }
 
+                    #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                    let apply_started_at = diag_enabled.then(std::time::Instant::now);
                     self.apply_witness(opid, witness);
+                    #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                    if let Some(apply_started_at) = apply_started_at {
+                        diag_apply_ns += apply_started_at.elapsed().as_nanos();
+                    }
                 }
             } else {
                 for (pos, seal) in block.defined_seals.iter() {
@@ -487,11 +520,23 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             if is_genesis {
                 is_genesis = false
             } else if let Some(operation) = operation {
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                let apply_started_at = diag_enabled.then(std::time::Instant::now);
                 self.apply_operation(operation);
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                if let Some(apply_started_at) = apply_started_at {
+                    diag_apply_ns += apply_started_at.elapsed().as_nanos();
+                }
             }
 
             if !block.defined_seals.is_empty() {
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                let apply_started_at = diag_enabled.then(std::time::Instant::now);
                 self.apply_seals(opid, block.defined_seals);
+                #[cfg(any(feature = "verify-diagnostics", feature = "parallel"))]
+                if let Some(apply_started_at) = apply_started_at {
+                    diag_apply_ns += apply_started_at.elapsed().as_nanos();
+                }
             }
         }
 
@@ -503,13 +548,21 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             let seal_close_us = diag_seal_close_ns / 1_000;
             let avg_seal_close_us =
                 if diag_seal_close_ops > 0 { seal_close_us / diag_seal_close_ops as u128 } else { 0 };
+            let read_us = diag_read_ns / 1_000;
+            let known_check_us = diag_known_check_ns / 1_000;
+            let apply_us = diag_apply_ns / 1_000;
+            // Whatever the named buckets do not cover (seal-map maintenance, subset check, resolve …).
+            let misc_us =
+                total_us.saturating_sub(alu_verify_us + seal_close_us + read_us + known_check_us + apply_us);
             eprintln!(
                 "rgb_verify_diag path=serial contract_id={contract_id} total_ops={diag_total_ops} \
 known_skipped={diag_known_skipped} verified_ops={diag_verified_ops} \
 verify_us={alu_verify_us} avg_verify_us={avg_alu_verify_us} \
 alu_verify_us={alu_verify_us} avg_alu_verify_us={avg_alu_verify_us} \
 seal_close_ops={diag_seal_close_ops} closed_seals={diag_closed_seals} \
-seal_close_us={seal_close_us} avg_seal_close_us={avg_seal_close_us} total_us={total_us}"
+seal_close_us={seal_close_us} avg_seal_close_us={avg_seal_close_us} \
+read_us={read_us} known_check_us={known_check_us} apply_us={apply_us} misc_us={misc_us} \
+total_us={total_us}"
             );
         }
 
