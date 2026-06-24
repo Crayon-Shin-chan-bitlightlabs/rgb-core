@@ -119,13 +119,17 @@ pub trait ContractApi<Seal: RgbSeal> {
     ///
     /// Implementations may return `true` only when the exact witness has already been accepted for
     /// `opid`. Returning `false` preserves the default full verification path.
-    fn is_witness_known(&mut self, _opid: Opid, _witness: &SealWitness<Seal>) -> bool { false }
+    fn is_witness_known(&mut self, _opid: Opid, _witness: &SealWitness<Seal>) -> bool {
+        false
+    }
 
     /// Returns a previously verified resolved seal for a known state cell.
     ///
     /// This is only used when a consignment intentionally omits already-known ancestor operations.
     /// Returning `None` preserves the default full-history verification path.
-    fn known_seal(&mut self, _addr: CellAddr) -> Option<Seal> { None }
+    fn known_seal(&mut self, _addr: CellAddr) -> Option<Seal> {
+        None
+    }
 
     /// Detects whether the provided seal definitions are already stored for a known operation.
     ///
@@ -173,6 +177,80 @@ pub trait ParallelVerifyMemory {
     /// Borrow a `Sync` read-only verification context. It MUST resolve the same memory cells as
     /// [`ContractApi::memory`] for every operation reachable during verification.
     fn verify_context(&self) -> Self::Ctx<'_>;
+}
+
+#[cfg(feature = "parallel")]
+fn operation_dependency_layers<Seal: RgbSeal>(blocks: &[OperationSeals<Seal>]) -> Vec<Vec<usize>> {
+    // Opids + opid -> stream index.
+    let opids = blocks
+        .iter()
+        .map(|block| block.operation.opid())
+        .collect::<Vec<_>>();
+    let mut index = BTreeMap::<Opid, usize>::new();
+    for (i, opid) in opids.iter().enumerate() {
+        index.insert(*opid, i);
+    }
+
+    // Edge producer -> consumer for every in-batch input (`destructible_in` addr opid and
+    // `immutable_in` opid). Also chain operations that consume the same destructible cell in
+    // stream order: even if the producer is already committed, these operations race on the same
+    // owned state and must observe each other's serial apply effects.
+    let n = blocks.len();
+    let mut indegree = alloc::vec![0usize; n];
+    let mut dependents = Vec::<Vec<usize>>::new();
+    dependents.resize_with(n, Vec::new);
+    let mut last_destructible_consumer = BTreeMap::<CellAddr, usize>::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let mut deps = BTreeSet::<usize>::new();
+        for input in &block.operation.destructible_in {
+            if let Some(&p) = index.get(&input.addr.opid) {
+                if p != i {
+                    deps.insert(p);
+                }
+            }
+            if let Some(prev) = last_destructible_consumer.insert(input.addr, i) {
+                if prev != i {
+                    deps.insert(prev);
+                }
+            }
+        }
+        for addr in &block.operation.immutable_in {
+            if let Some(&p) = index.get(&addr.opid) {
+                if p != i {
+                    deps.insert(p);
+                }
+            }
+        }
+        for p in deps {
+            dependents[p].push(i);
+            indegree[i] += 1;
+        }
+    }
+
+    let mut layers = Vec::<Vec<usize>>::new();
+    let mut frontier = (0..n).filter(|&i| indegree[i] == 0).collect::<Vec<_>>();
+    let mut emitted = 0usize;
+    while !frontier.is_empty() {
+        frontier.sort_unstable();
+        let mut next = Vec::<usize>::new();
+        for &i in &frontier {
+            emitted += 1;
+            for &d in &dependents[i] {
+                indegree[d] -= 1;
+                if indegree[d] == 0 {
+                    next.push(d);
+                }
+            }
+        }
+        layers.push(frontier);
+        frontier = next;
+    }
+    // A valid consignment DAG cannot cycle; if it somehow does, fall back to one serial layer
+    // so verification still rejects it rather than silently dropping operations.
+    if emitted != n {
+        return alloc::vec![(0..n).collect::<Vec<usize>>()];
+    }
+    layers
 }
 
 /// Main implementation of the contract verification procedure.
@@ -231,7 +309,11 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // we know their commitment auth token but do not know the definition.
             let reported_is_subset = block.defined_seals.values().all(|seal| {
                 let auth = seal.auth_token();
-                block.operation.destructible_out.iter().any(|cell| cell.auth == auth)
+                block
+                    .operation
+                    .destructible_out
+                    .iter()
+                    .any(|cell| cell.auth == auth)
             });
             if !reported_is_subset {
                 let defined = block
@@ -343,10 +425,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
     /// earliest in stream order. Valid consignments produce byte-for-byte identical ledger state.
     #[cfg(feature = "parallel")]
     #[allow(clippy::result_large_err)]
-    fn evaluate_parallel<R: ReadOperation<Seal = Seal>>(
-        &mut self,
-        mut reader: R,
-    ) -> Result<(), VerificationError<Seal>>
+    fn evaluate_parallel<R: ReadOperation<Seal = Seal>>(&mut self, mut reader: R) -> Result<(), VerificationError<Seal>>
     where
         Self: Sized + ParallelVerifyMemory,
     {
@@ -375,63 +454,12 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             return Ok(());
         }
 
-        // 2) Opids + opid -> stream index.
-        let opids = blocks.iter().map(|b| b.operation.opid()).collect::<Vec<_>>();
-        let mut index = BTreeMap::<Opid, usize>::new();
-        for (i, opid) in opids.iter().enumerate() {
-            index.insert(*opid, i);
-        }
-
-        // 3) Dependency layering (Kahn). Edge producer -> consumer for every in-batch input
-        //    (`destructible_in` addr opid and `immutable_in` opid). Genesis (idx 0) has no deps.
-        let n = blocks.len();
-        let mut indegree = alloc::vec![0usize; n];
-        let mut dependents = Vec::<Vec<usize>>::new();
-        dependents.resize_with(n, Vec::new);
-        for (i, block) in blocks.iter().enumerate() {
-            let mut deps = BTreeSet::<usize>::new();
-            for input in &block.operation.destructible_in {
-                if let Some(&p) = index.get(&input.addr.opid) {
-                    if p != i {
-                        deps.insert(p);
-                    }
-                }
-            }
-            for addr in &block.operation.immutable_in {
-                if let Some(&p) = index.get(&addr.opid) {
-                    if p != i {
-                        deps.insert(p);
-                    }
-                }
-            }
-            for p in deps {
-                dependents[p].push(i);
-                indegree[i] += 1;
-            }
-        }
-        let mut layers = Vec::<Vec<usize>>::new();
-        let mut frontier = (0..n).filter(|&i| indegree[i] == 0).collect::<Vec<_>>();
-        let mut emitted = 0usize;
-        while !frontier.is_empty() {
-            frontier.sort_unstable(); // deterministic, preserves stream order within a layer
-            let mut next = Vec::<usize>::new();
-            for &i in &frontier {
-                emitted += 1;
-                for &d in &dependents[i] {
-                    indegree[d] -= 1;
-                    if indegree[d] == 0 {
-                        next.push(d);
-                    }
-                }
-            }
-            layers.push(frontier);
-            frontier = next;
-        }
-        // A valid consignment DAG cannot cycle; if it somehow does, fall back to one serial layer
-        // so verification still rejects it rather than silently dropping operations.
-        if emitted != n {
-            layers = alloc::vec![(0..n).collect::<Vec<usize>>()];
-        }
+        // 2) Dependency layering (Kahn). Genesis (idx 0) has no deps.
+        let opids = blocks
+            .iter()
+            .map(|b| b.operation.opid())
+            .collect::<Vec<_>>();
+        let layers = operation_dependency_layers(&blocks);
 
         // Per-op work carried from the serial pre-pass into parallel verify and serial apply.
         // Side-effecting material for the serial apply phase. The operation itself is NOT kept
@@ -494,12 +522,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         .iter()
                         .map(|(pos, seal)| (*pos, seal.to_string()))
                         .collect();
-                    return Err(VerificationError::SealsDefinitionMismatch {
-                        opid,
-                        reported,
-                        defined,
-                        sources,
-                    });
+                    return Err(VerificationError::SealsDefinitionMismatch { opid, reported, defined, sources });
                 }
 
                 let mut closed_seals = Vec::<Seal>::new();
@@ -644,7 +667,9 @@ pub enum VerificationError<Seal: RgbSeal> {
 
 // We need manual implementation since otherwise we get an unneeded `Seal::PubWitness: Debug` bound
 impl<Seal: RgbSeal> Debug for VerificationError<Seal> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result { write!(f, "{self}") }
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self}")
+    }
 }
 
 #[cfg(test)]
@@ -673,7 +698,9 @@ mod test {
         }
     }
     impl TestReader {
-        pub fn new(vec: Vec<OperationSeals<TxoSeal>>) -> Self { Self(vec.into_iter()) }
+        pub fn new(vec: Vec<OperationSeals<TxoSeal>>) -> Self {
+            Self(vec.into_iter())
+        }
     }
 
     struct TestContract {
@@ -687,18 +714,34 @@ mod test {
         pub witnesses: BTreeMap<Opid, Vec<SealWitness<TxoSeal>>>,
     }
     impl Memory for TestContract {
-        fn destructible(&self, addr: CellAddr) -> Option<StateCell> { self.owned.get(&addr).cloned() }
-        fn immutable(&self, addr: CellAddr) -> Option<StateValue> { self.global.get(&addr).cloned() }
+        fn destructible(&self, addr: CellAddr) -> Option<StateCell> {
+            self.owned.get(&addr).cloned()
+        }
+        fn immutable(&self, addr: CellAddr) -> Option<StateValue> {
+            self.global.get(&addr).cloned()
+        }
     }
     impl LibRepo for TestContract {
-        fn get_lib(&self, lib_id: LibId) -> Option<&Lib> { self.libs.get(&lib_id) }
+        fn get_lib(&self, lib_id: LibId) -> Option<&Lib> {
+            self.libs.get(&lib_id)
+        }
     }
     impl ContractApi<TxoSeal> for TestContract {
-        fn contract_id(&self) -> ContractId { self.contract_id }
-        fn codex(&self) -> &Codex { &self.codex }
-        fn repo(&self) -> &impl LibRepo { self }
-        fn memory(&self) -> &impl Memory { self }
-        fn is_known(&self, opid: Opid) -> bool { self.known_ops.contains_key(&opid) }
+        fn contract_id(&self) -> ContractId {
+            self.contract_id
+        }
+        fn codex(&self) -> &Codex {
+            &self.codex
+        }
+        fn repo(&self) -> &impl LibRepo {
+            self
+        }
+        fn memory(&self) -> &impl Memory {
+            self
+        }
+        fn is_known(&self, opid: Opid) -> bool {
+            self.known_ops.contains_key(&opid)
+        }
         fn apply_operation(&mut self, op: VerifiedOperation) {
             let opid = op.opid();
             let op = op.into_operation();
@@ -723,17 +766,25 @@ mod test {
     struct TestVerifyCtx<'a>(&'a TestContract);
     #[cfg(feature = "parallel")]
     impl Memory for TestVerifyCtx<'_> {
-        fn destructible(&self, addr: CellAddr) -> Option<StateCell> { self.0.destructible(addr) }
-        fn immutable(&self, addr: CellAddr) -> Option<StateValue> { self.0.immutable(addr) }
+        fn destructible(&self, addr: CellAddr) -> Option<StateCell> {
+            self.0.destructible(addr)
+        }
+        fn immutable(&self, addr: CellAddr) -> Option<StateValue> {
+            self.0.immutable(addr)
+        }
     }
     #[cfg(feature = "parallel")]
     impl LibRepo for TestVerifyCtx<'_> {
-        fn get_lib(&self, lib_id: LibId) -> Option<&Lib> { self.0.get_lib(lib_id) }
+        fn get_lib(&self, lib_id: LibId) -> Option<&Lib> {
+            self.0.get_lib(lib_id)
+        }
     }
     #[cfg(feature = "parallel")]
     impl super::ParallelVerifyMemory for TestContract {
         type Ctx<'a> = TestVerifyCtx<'a>;
-        fn verify_context(&self) -> TestVerifyCtx<'_> { TestVerifyCtx(self) }
+        fn verify_context(&self) -> TestVerifyCtx<'_> {
+            TestVerifyCtx(self)
+        }
     }
 
     fn lib() -> Lib {
@@ -853,18 +904,11 @@ mod test {
                 assert_eq!(serial.known_ops, parallel.known_ops, "known_ops diverged");
                 assert_eq!(serial.owned, parallel.owned, "owned state diverged");
                 assert_eq!(serial.global, parallel.global, "global state diverged");
-                assert_eq!(
-                    serial.seal_definitions, parallel.seal_definitions,
-                    "seal definitions diverged"
-                );
+                assert_eq!(serial.seal_definitions, parallel.seal_definitions, "seal definitions diverged");
                 assert_eq!(serial.witnesses, parallel.witnesses, "witnesses diverged");
             }
             (Err(serial_err), Err(parallel_err)) => {
-                assert_eq!(
-                    serial_err.to_string(),
-                    parallel_err.to_string(),
-                    "error mismatch"
-                );
+                assert_eq!(serial_err.to_string(), parallel_err.to_string(), "error mismatch");
             }
             _ => panic!("serial and parallel evaluation disagree on success/failure"),
         }
@@ -896,11 +940,7 @@ mod test {
         let genesis = genesis();
         let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
         let contract_id = contract().contract_id;
-        let mut ops = vec![OperationSeals {
-            operation: genesis_op,
-            defined_seals: none!(),
-            witness: None,
-        }];
+        let mut ops = vec![OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None }];
         for tag in 1..=6u64 {
             ops.push(OperationSeals {
                 operation: standalone_op(tag, contract_id),
@@ -909,6 +949,26 @@ mod test {
             });
         }
         assert_serial_parallel_equiv(TestReader::new(ops));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_layers_serialize_shared_destructible_input_consumers() {
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(contract().contract_id);
+        let first = operation();
+        let mut second = operation();
+        // Keep the same destructible input but make the operation id distinct.
+        second.immutable_out = small_vec![StateData::new(0u64, 42u64)];
+
+        let ops: Vec<OperationSeals<TxoSeal>> = vec![
+            OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+            OperationSeals { operation: first, defined_seals: none!(), witness: None },
+            OperationSeals { operation: second, defined_seals: none!(), witness: None },
+        ];
+        let layers = operation_dependency_layers(&ops);
+
+        assert_eq!(layers, vec![vec![0], vec![1], vec![2]]);
     }
 
     #[cfg(feature = "parallel")]
@@ -1018,7 +1078,9 @@ Sources for the reported seals: {
     }
 
     #[test]
-    #[should_panic(expected = "unknown seal definition for cell address k7fHvPyBlnM8m1n0QUaqNhB0I8kTwWXmi7nB_ZjTGVc:0.")]
+    #[should_panic(
+        expected = "unknown seal definition for cell address k7fHvPyBlnM8m1n0QUaqNhB0I8kTwWXmi7nB_ZjTGVc:0."
+    )]
     fn seal_unknown() {
         let genesis = genesis();
         let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
@@ -1032,7 +1094,9 @@ Sources for the reported seals: {
     }
 
     #[test]
-    #[should_panic(expected = "unknown seal definition for cell address k7fHvPyBlnM8m1n0QUaqNhB0I8kTwWXmi7nB_ZjTGVc:0.")]
+    #[should_panic(
+        expected = "unknown seal definition for cell address k7fHvPyBlnM8m1n0QUaqNhB0I8kTwWXmi7nB_ZjTGVc:0."
+    )]
     fn genesis_with_wout() {
         let mut genesis = genesis();
         genesis.destructible_out[0].auth = SEAL_WOUT.auth_token();
