@@ -158,6 +158,13 @@ pub trait ContractApi<Seal: RgbSeal> {
     /// The method is NOT called for the genesis operation.
     fn apply_operation(&mut self, op: VerifiedOperation);
 
+    /// Stages outputs from a fully-known operation so later operations in the same consignment can
+    /// read already-validated state without re-running operation verification.
+    ///
+    /// Implementations must treat this as verification-local state. It must not make an already
+    /// spent state cell spendable again after the consume finishes.
+    fn stage_known_operation(&mut self, _opid: Opid, _operation: &Operation) {}
+
     /// # Nota bene:
     ///
     /// The method is called for all operations, including known ones, for which the consignment
@@ -470,6 +477,9 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     if let Some(seal_map_started_at) = seal_map_started_at {
                         diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
                     }
+                }
+                if !is_genesis {
+                    self.stage_known_operation(opid, &block.operation);
                 }
                 continue;
             }
@@ -904,7 +914,11 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         enum Ready<Seal: RgbSeal> {
             Apply(Box<Apply<Seal>>),
             Fault(Box<VerificationError<Seal>>),
-            Skip { destructible_inputs: Vec<CellAddr> },
+            Skip {
+                opid: Opid,
+                operation: Operation,
+                destructible_inputs: Vec<CellAddr>,
+            },
         }
 
         let mut seals = BTreeMap::<CellAddr, Seal>::new();
@@ -940,7 +954,14 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         .iter()
                         .map(|input| input.addr)
                         .collect();
-                    layer_ready.push((i, Ready::Skip { destructible_inputs }));
+                    layer_ready.push((
+                        i,
+                        Ready::Skip {
+                            opid,
+                            operation: blocks[i].operation.clone(),
+                            destructible_inputs,
+                        },
+                    ));
                     continue;
                 }
                 if let Some(known_check_started_at) = known_check_started_at {
@@ -1166,13 +1187,20 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
 
             while let Some(ready_item) = ready.remove(&next_apply_idx) {
                 let apply = match ready_item {
-                    Ready::Skip { destructible_inputs } => {
+                    Ready::Skip {
+                        opid,
+                        operation,
+                        destructible_inputs,
+                    } => {
                         let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                         for addr in destructible_inputs {
                             seals.remove(&addr);
                         }
                         if let Some(seal_map_started_at) = seal_map_started_at {
                             diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                        }
+                        if next_apply_idx != 0 {
+                            self.stage_known_operation(opid, &operation);
                         }
                         next_apply_idx += 1;
                         continue;
@@ -1436,6 +1464,25 @@ mod test {
         fn repo(&self) -> &impl LibRepo { self }
         fn memory(&self) -> &impl Memory { self }
         fn is_known(&self, opid: Opid) -> bool { self.known_ops.contains_key(&opid) }
+        fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<TxoSeal>) -> bool {
+            self.witnesses
+                .get(&opid)
+                .is_some_and(|witnesses| witnesses.contains(witness))
+        }
+        fn known_seal(&mut self, addr: CellAddr) -> Option<TxoSeal> {
+            self.seal_definitions
+                .get(&addr.opid)?
+                .get(&addr.pos)?
+                .to_src()
+        }
+        fn are_seals_known(&mut self, opid: Opid, seals: &SmallOrdMap<u16, WTxoSeal>) -> bool {
+            let Some(stored) = self.seal_definitions.get(&opid) else {
+                return false;
+            };
+            seals
+                .iter()
+                .all(|(no, seal)| stored.get(no).is_some_and(|stored| stored == seal))
+        }
         fn apply_operation(&mut self, op: VerifiedOperation) {
             let opid = op.opid();
             let op = op.into_operation();
@@ -1447,6 +1494,15 @@ mod test {
                 self.owned.insert(CellAddr::new(opid, no as u16), *inp);
             }
             self.known_ops.insert(opid, op);
+        }
+        fn stage_known_operation(&mut self, opid: Opid, operation: &Operation) {
+            for (no, inp) in operation.immutable_out.iter().enumerate() {
+                self.global
+                    .insert(CellAddr::new(opid, no as u16), inp.value);
+            }
+            for (no, inp) in operation.destructible_out.iter().enumerate() {
+                self.owned.insert(CellAddr::new(opid, no as u16), *inp);
+            }
         }
         fn apply_seals(&mut self, opid: Opid, seals: SmallOrdMap<u16, WTxoSeal>) {
             self.seal_definitions.entry(opid).or_default().extend(seals);
@@ -1591,7 +1647,6 @@ mod test {
         }
     }
 
-    #[cfg(feature = "parallel")]
     fn seal_source_op(tag: u64, contract_id: ContractId) -> Operation {
         Operation {
             version: default!(),
@@ -1610,7 +1665,6 @@ mod test {
         }
     }
 
-    #[cfg(feature = "parallel")]
     fn seal_consumer_op(source: Opid, contract_id: ContractId) -> Operation {
         Operation {
             version: default!(),
@@ -1688,7 +1742,7 @@ mod test {
     #[test]
     fn parallel_layers_serialize_shared_destructible_input_consumers() {
         let genesis = genesis();
-        let genesis_op = genesis.to_operation(contract().contract_id);
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
         let first = operation();
         let mut second = operation();
         // Keep the same destructible input but make the operation id distinct.
@@ -1752,6 +1806,43 @@ mod test {
             OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
             OperationSeals { operation, defined_seals: none!(), witness: None },
         ]));
+    }
+
+    #[test]
+    fn known_skip_stages_outputs_for_later_new_operation() {
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let contract_id = contract().contract_id;
+        let producer = seal_source_op(21, contract_id);
+        let producer_opid = producer.opid();
+        let consumer = seal_consumer_op(producer_opid, contract_id);
+        let known_witness = SealWitness::new(strict_dumb!(), strict_dumb!());
+
+        let mut contract = contract();
+        contract.known_ops.insert(producer_opid, producer.clone());
+        contract
+            .seal_definitions
+            .insert(producer_opid, map! { 0 => SEAL_1 });
+        contract
+            .witnesses
+            .insert(producer_opid, vec![known_witness.clone()]);
+
+        let err = contract
+            .evaluate(TestReader::new(vec![
+                OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+                OperationSeals {
+                    operation: producer,
+                    defined_seals: small_bmap! { 0 => SEAL_1 },
+                    witness: Some(known_witness),
+                },
+                OperationSeals { operation: consumer, defined_seals: none!(), witness: None },
+            ]))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no witness known for the operation"),
+            "expected verification to pass the staged known output and fail later on missing witness, got: {err}"
+        );
     }
 
     #[cfg(feature = "parallel")]
