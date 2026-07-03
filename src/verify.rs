@@ -721,7 +721,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     + pub_id_us
                     + seal_to_src_us,
             );
-            tracing::debug!(
+            tracing::warn!(
                 target: "rgb_verify_diag",
                 path = "serial",
                 contract_id = %contract_id,
@@ -864,7 +864,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             let total_ops = blocks.len();
             let avg_width = if layer_count > 0 { total_ops as f64 / layer_count as f64 } else { 0.0 };
             let wide_layers = layers.iter().filter(|l| l.len() > 1).count();
-            tracing::debug!(
+            tracing::warn!(
                 target: "rgb_verify_diag",
                 path = "parallel",
                 kind = "layout",
@@ -1323,7 +1323,7 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                     + seal_to_src_us
                     + apply_us,
             );
-            tracing::debug!(
+            tracing::warn!(
                 target: "rgb_verify_diag",
                 path = "parallel",
                 kind = "timing",
