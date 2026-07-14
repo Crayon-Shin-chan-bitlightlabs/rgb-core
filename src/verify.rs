@@ -83,6 +83,21 @@ pub trait ReadOperation: Sized {
     /// Reads an operation and its seals from a consignment stream and initialize the witness
     /// reader.
     fn read_operation(&mut self) -> Result<Option<OperationSeals<Self::Seal>>, impl Error + 'static>;
+
+    /// Reads an operation together with its `opid`, allowing a reader that already computed the
+    /// content-addressed commitment during decode to hand it over instead of forcing `evaluate` to
+    /// recompute it per op. The default implementation recomputes `opid()` so existing readers keep
+    /// working unchanged; `PredecodedOpReader` overrides this to return the opid memoized at
+    /// decode.
+    ///
+    /// Trust note: the returned `opid` must be the reader's own hash of the very operation it
+    /// returns (never a value taken off the wire). `evaluate` recomputes and hard-asserts equality
+    /// when `RGB_VERIFY_OPID_MEMO_ASSERT` is set, and always recomputes for genesis (whose
+    /// `contract_id` is rewritten during verification).
+    fn read_operation_with_opid(&mut self) -> Result<Option<(Opid, OperationSeals<Self::Seal>)>, impl Error + 'static> {
+        self.read_operation()
+            .map(|maybe| maybe.map(|op| (op.operation.opid(), op)))
+    }
 }
 
 /// API exposed by the contract required for evaluating and verifying the contract state (see
@@ -131,9 +146,7 @@ pub trait ContractApi<Seal: RgbSeal> {
     ///
     /// Implementations may return `true` only when every provided definition exactly matches
     /// previously accepted data. Returning `false` preserves the default full-history path.
-    fn are_seals_known(&mut self, _opid: Opid, _seals: &SmallOrdMap<u16, Seal::Definition>) -> bool {
-        false
-    }
+    fn are_seals_known(&mut self, _opid: Opid, _seals: &SmallOrdMap<u16, Seal::Definition>) -> bool { false }
 
     /// # Nota bene:
     ///
@@ -142,6 +155,13 @@ pub trait ContractApi<Seal: RgbSeal> {
     ///
     /// The method is NOT called for the genesis operation.
     fn apply_operation(&mut self, op: VerifiedOperation);
+
+    /// Stages outputs from a fully-known operation so later operations in the same consignment can
+    /// read already-validated state without re-running operation verification.
+    ///
+    /// Implementations must treat this as verification-local state. It must not make an already
+    /// spent state cell spendable again after the consume finishes.
+    fn stage_known_operation(&mut self, _opid: Opid, _operation: &Operation) {}
 
     /// # Nota bene:
     ///
@@ -156,6 +176,27 @@ pub trait ContractApi<Seal: RgbSeal> {
     /// except genesis or operations with no destroyed state).
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<Seal>);
 }
+
+/// Release-effective (not `debug_assert`) opt-in: when `RGB_VERIFY_OPID_MEMO_ASSERT` is set,
+/// `evaluate` recomputes `opid()` for every non-genesis op and hard-panics if it
+/// differs from the memoized value carried by the reader. Used to certify the opid-memoization path
+/// against the recompute path before enabling it in production. Off by default (memoized opid used
+/// directly, zero recompute).
+fn opid_memo_assert_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RGB_VERIFY_OPID_MEMO_ASSERT")
+            .map(|value| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(feature = "verify-diagnostics")]
+fn verify_diag_enabled() -> bool { true }
 
 /// Main implementation of the contract verification procedure.
 ///
@@ -175,35 +216,142 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
         let mut is_genesis = true;
         let mut seals = BTreeMap::<CellAddr, Seal>::new();
 
-        while let Some(mut block) = reader
-            .read_operation()
-            .map_err(|e| VerificationError::Stream(Box::new(e)))?
-        {
-            // Genesis cannot commit to the contract id since the contract does not exist yet;
-            // thus, we have to apply this little trick
-            if is_genesis {
+        // Diagnostics are compiled only when explicitly requested and do not
+        // alter the serial verification procedure.
+        #[cfg(feature = "verify-diagnostics")]
+        let diag_enabled = verify_diag_enabled();
+        #[cfg(feature = "verify-diagnostics")]
+        let diag_started_at = std::time::Instant::now();
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_total_ops = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_known_skipped = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_verified_ops = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_alu_verify_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_seal_close_ops = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_closed_seals = 0usize;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_seal_close_ns = 0u128;
+        // Residual decomposition (P0): the alu+seal split showed ~96% of `evaluate` is neither
+        // AluVM verify nor seal closing. These buckets attribute that residual across the per-op
+        // steps every op pays — stream decode, the `is_known`/witness/seals membership checks (paid
+        // by the ~89% known ops that early-`continue`), and the `apply_*` writes — so the dominant
+        // cost is identifiable without guessing.
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_read_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_known_check_ns = 0u128;
+        // `apply_op` = `apply_operation` (ledger/state side, incl. per-op `recompute`);
+        // `apply_seal` = `apply_seals` + `apply_witness` (pile side). Split so the ledger-vs-pile
+        // share of the dominant `apply` residual is visible.
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_apply_op_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_apply_seal_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_apply_witness_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_apply_seals_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_subset_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_seal_map_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_resolve_ns = 0u128;
+        // Per-op `opid()` recompute (content-addressed commitment). Paid by *every* op including the
+        // ~95% known-skipped ones, and previously folded into `misc`. Broken out to confirm/quantify
+        // it as the dominant `misc` cost.
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_opid_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_pub_id_ns = 0u128;
+        #[cfg(feature = "verify-diagnostics")]
+        let mut diag_seal_to_src_ns = 0u128;
+
+        loop {
+            #[cfg(feature = "verify-diagnostics")]
+            let read_started_at = diag_enabled.then(std::time::Instant::now);
+            let next = reader
+                .read_operation_with_opid()
+                .map_err(|e| VerificationError::Stream(Box::new(e)))?;
+            #[cfg(feature = "verify-diagnostics")]
+            if let Some(read_started_at) = read_started_at {
+                diag_read_ns += read_started_at.elapsed().as_nanos();
+            }
+            let Some((memo_opid, mut block)) = next else { break };
+            #[cfg(feature = "verify-diagnostics")]
+            if diag_enabled {
+                diag_total_ops += 1;
+            }
+            // Genesis cannot commit to the contract id since the contract does not exist yet; thus,
+            // we have to apply this little trick. Its opid must therefore be recomputed *after* the
+            // contract_id rewrite — genesis never trusts the memoized (pre-rewrite) opid.
+            #[cfg(feature = "verify-diagnostics")]
+            let opid_started_at = diag_enabled.then(std::time::Instant::now);
+            let opid = if is_genesis {
                 if block.operation.contract_id.to_byte_array() != codex_id.to_byte_array() {
                     return Err(VerificationError::NoCodexCommitment);
                 }
                 block.operation.contract_id = contract_id;
+                block.operation.opid()
+            } else {
+                if opid_memo_assert_enabled() {
+                    let recomputed = block.operation.opid();
+                    if recomputed != memo_opid {
+                        panic!(
+                            "RGB verify opid memo mismatch (non-genesis): memoized {memo_opid} != recomputed \
+                             {recomputed}"
+                        );
+                    }
+                }
+                memo_opid
+            };
+            #[cfg(feature = "verify-diagnostics")]
+            if let Some(opid_started_at) = opid_started_at {
+                diag_opid_ns += opid_started_at.elapsed().as_nanos();
             }
-            let opid = block.operation.opid();
 
             // If the full operation aux data has already been accepted, the
             // stored seal definitions were validated against this operation
             // before. Unknown or partially known aux data still falls through
             // to the normal subset and witness checks below.
+            #[cfg(feature = "verify-diagnostics")]
+            let known_check_started_at = diag_enabled.then(std::time::Instant::now);
             let known = self.is_known(opid);
             let witness_known = match block.witness.as_ref() {
                 Some(witness) if known => self.is_witness_known(opid, witness),
                 _ => false,
             };
+            // `&&` short-circuits exactly as before: `are_seals_known` runs only when both prior
+            // checks pass. Materialized into a binding only so the membership-check span can close.
+            let fully_known = known && witness_known && self.are_seals_known(opid, &block.defined_seals);
+            #[cfg(feature = "verify-diagnostics")]
+            if let Some(known_check_started_at) = known_check_started_at {
+                diag_known_check_ns += known_check_started_at.elapsed().as_nanos();
+            }
 
-            if known && witness_known && self.are_seals_known(opid, &block.defined_seals) {
+            if fully_known {
+                #[cfg(feature = "verify-diagnostics")]
+                if diag_enabled {
+                    diag_known_skipped += 1;
+                }
                 if !seals.is_empty() {
+                    #[cfg(feature = "verify-diagnostics")]
+                    let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                     for input in &block.operation.destructible_in {
                         seals.remove(&input.addr);
                     }
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(seal_map_started_at) = seal_map_started_at {
+                        diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                    }
+                }
+                if !is_genesis {
+                    self.stage_known_operation(opid, &block.operation);
                 }
                 continue;
             }
@@ -211,10 +359,20 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // We need to check that all seal definitions strictly match operation-defined destructible cells
             // It is a subset and not an equal set since some seals might be unknown to us:
             // we know their commitment auth token but do not know the definition.
+            #[cfg(feature = "verify-diagnostics")]
+            let subset_started_at = diag_enabled.then(std::time::Instant::now);
             let reported_is_subset = block.defined_seals.values().all(|seal| {
                 let auth = seal.auth_token();
-                block.operation.destructible_out.iter().any(|cell| cell.auth == auth)
+                block
+                    .operation
+                    .destructible_out
+                    .iter()
+                    .any(|cell| cell.auth == auth)
             });
+            #[cfg(feature = "verify-diagnostics")]
+            if let Some(subset_started_at) = subset_started_at {
+                diag_subset_ns += subset_started_at.elapsed().as_nanos();
+            }
             if !reported_is_subset {
                 let defined = block
                     .operation
@@ -239,11 +397,19 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             let mut closed_seals = Vec::<Seal>::new();
             if witness_known {
                 if !seals.is_empty() {
+                    #[cfg(feature = "verify-diagnostics")]
+                    let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                     for input in &block.operation.destructible_in {
                         seals.remove(&input.addr);
                     }
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(seal_map_started_at) = seal_map_started_at {
+                        diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                    }
                 }
             } else {
+                #[cfg(feature = "verify-diagnostics")]
+                let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                 for input in &block.operation.destructible_in {
                     let seal = seals
                         .remove(&input.addr)
@@ -251,15 +417,26 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
                         .ok_or(VerificationError::SealUnknown(input.addr))?;
                     closed_seals.push(seal);
                 }
+                #[cfg(feature = "verify-diagnostics")]
+                if let Some(seal_map_started_at) = seal_map_started_at {
+                    diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                }
             }
 
             let operation = if known {
                 None
             } else {
                 // Verify the operation
+                #[cfg(feature = "verify-diagnostics")]
+                let verify_started_at = diag_enabled.then(std::time::Instant::now);
                 let verified = self
                     .codex()
                     .verify(contract_id, block.operation, self.memory(), self.repo())?;
+                #[cfg(feature = "verify-diagnostics")]
+                if let Some(verify_started_at) = verify_started_at {
+                    diag_alu_verify_ns += verify_started_at.elapsed().as_nanos();
+                    diag_verified_ops += 1;
+                }
                 Some(verified)
             };
 
@@ -268,26 +445,85 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // Now we can add operation-defined seals to the set of known seals
             if let Some(witness) = block.witness {
                 //  Each witness actually produces its own set of witness-output-based seal sources.
+                #[cfg(feature = "verify-diagnostics")]
+                let pub_id_started_at = diag_enabled.then(std::time::Instant::now);
                 let pub_id = witness.published.pub_id();
+                #[cfg(feature = "verify-diagnostics")]
+                if let Some(pub_id_started_at) = pub_id_started_at {
+                    diag_pub_id_ns += pub_id_started_at.elapsed().as_nanos();
+                }
 
                 for (pos, seal) in block.defined_seals.iter() {
                     let addr = CellAddr::new(opid, *pos);
-                    let seal = seal.to_src().unwrap_or_else(|| seal.resolve(pub_id));
+                    #[cfg(feature = "verify-diagnostics")]
+                    let to_src_started_at = diag_enabled.then(std::time::Instant::now);
+                    let src = seal.to_src();
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(to_src_started_at) = to_src_started_at {
+                        diag_seal_to_src_ns += to_src_started_at.elapsed().as_nanos();
+                    }
+                    let seal = if let Some(seal) = src {
+                        seal
+                    } else {
+                        #[cfg(feature = "verify-diagnostics")]
+                        let resolve_started_at = diag_enabled.then(std::time::Instant::now);
+                        let seal = seal.resolve(pub_id);
+                        #[cfg(feature = "verify-diagnostics")]
+                        if let Some(resolve_started_at) = resolve_started_at {
+                            diag_resolve_ns += resolve_started_at.elapsed().as_nanos();
+                        }
+                        seal
+                    };
+                    #[cfg(feature = "verify-diagnostics")]
+                    let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                     seals.insert(addr, seal);
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(seal_map_started_at) = seal_map_started_at {
+                        diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                    }
                 }
 
                 if !witness_known {
                     let msg = opid.to_byte_array();
+                    #[cfg(feature = "verify-diagnostics")]
+                    let seal_close_started_at = diag_enabled.then(std::time::Instant::now);
                     witness
                         .verify_seals_closing(&closed_seals, msg.into())
                         .map_err(|e| VerificationError::SealsNotClosed(pub_id, opid, e))?;
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(seal_close_started_at) = seal_close_started_at {
+                        diag_seal_close_ns += seal_close_started_at.elapsed().as_nanos();
+                        diag_seal_close_ops += 1;
+                        diag_closed_seals += closed_seals.len();
+                    }
 
+                    #[cfg(feature = "verify-diagnostics")]
+                    let apply_started_at = diag_enabled.then(std::time::Instant::now);
                     self.apply_witness(opid, witness);
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(apply_started_at) = apply_started_at {
+                        let elapsed = apply_started_at.elapsed().as_nanos();
+                        diag_apply_witness_ns += elapsed;
+                        diag_apply_seal_ns += elapsed;
+                    }
                 }
             } else {
                 for (pos, seal) in block.defined_seals.iter() {
-                    if let Some(seal) = seal.to_src() {
+                    #[cfg(feature = "verify-diagnostics")]
+                    let to_src_started_at = diag_enabled.then(std::time::Instant::now);
+                    let src = seal.to_src();
+                    #[cfg(feature = "verify-diagnostics")]
+                    if let Some(to_src_started_at) = to_src_started_at {
+                        diag_seal_to_src_ns += to_src_started_at.elapsed().as_nanos();
+                    }
+                    if let Some(seal) = src {
+                        #[cfg(feature = "verify-diagnostics")]
+                        let seal_map_started_at = diag_enabled.then(std::time::Instant::now);
                         seals.insert(CellAddr::new(opid, *pos), seal);
+                        #[cfg(feature = "verify-diagnostics")]
+                        if let Some(seal_map_started_at) = seal_map_started_at {
+                            diag_seal_map_ns += seal_map_started_at.elapsed().as_nanos();
+                        }
                     }
                 }
 
@@ -299,16 +535,101 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             if is_genesis {
                 is_genesis = false
             } else if let Some(operation) = operation {
+                #[cfg(feature = "verify-diagnostics")]
+                let apply_started_at = diag_enabled.then(std::time::Instant::now);
                 self.apply_operation(operation);
+                #[cfg(feature = "verify-diagnostics")]
+                if let Some(apply_started_at) = apply_started_at {
+                    diag_apply_op_ns += apply_started_at.elapsed().as_nanos();
+                }
             }
 
             if !block.defined_seals.is_empty() {
+                #[cfg(feature = "verify-diagnostics")]
+                let apply_started_at = diag_enabled.then(std::time::Instant::now);
                 self.apply_seals(opid, block.defined_seals);
+                #[cfg(feature = "verify-diagnostics")]
+                if let Some(apply_started_at) = apply_started_at {
+                    let elapsed = apply_started_at.elapsed().as_nanos();
+                    diag_apply_seals_ns += elapsed;
+                    diag_apply_seal_ns += elapsed;
+                }
             }
+        }
+
+        #[cfg(feature = "verify-diagnostics")]
+        if diag_enabled {
+            let total_us = diag_started_at.elapsed().as_micros();
+            let alu_verify_us = diag_alu_verify_ns / 1_000;
+            let avg_alu_verify_us = if diag_verified_ops > 0 { alu_verify_us / diag_verified_ops as u128 } else { 0 };
+            let seal_close_us = diag_seal_close_ns / 1_000;
+            let avg_seal_close_us =
+                if diag_seal_close_ops > 0 { seal_close_us / diag_seal_close_ops as u128 } else { 0 };
+            let read_us = diag_read_ns / 1_000;
+            let known_check_us = diag_known_check_ns / 1_000;
+            let apply_op_us = diag_apply_op_ns / 1_000;
+            let apply_seal_us = diag_apply_seal_ns / 1_000;
+            let apply_witness_us = diag_apply_witness_ns / 1_000;
+            let apply_seals_us = diag_apply_seals_ns / 1_000;
+            let apply_us = apply_op_us + apply_seal_us;
+            let subset_us = diag_subset_ns / 1_000;
+            let seal_map_us = diag_seal_map_ns / 1_000;
+            let resolve_us = diag_resolve_ns / 1_000;
+            let opid_us = diag_opid_ns / 1_000;
+            let pub_id_us = diag_pub_id_ns / 1_000;
+            let seal_to_src_us = diag_seal_to_src_ns / 1_000;
+            // Whatever the named buckets do not cover (loop bookkeeping, branching, container work
+            // not included in the spans above).
+            let misc_us = total_us.saturating_sub(
+                alu_verify_us
+                    + seal_close_us
+                    + read_us
+                    + known_check_us
+                    + apply_us
+                    + subset_us
+                    + seal_map_us
+                    + resolve_us
+                    + opid_us
+                    + pub_id_us
+                    + seal_to_src_us,
+            );
+            tracing::warn!(
+                target: "rgb_verify_diag",
+                path = "serial",
+                contract_id = %contract_id,
+                total_ops = diag_total_ops,
+                known_skipped = diag_known_skipped,
+                verified_ops = diag_verified_ops,
+                verify_us = alu_verify_us,
+                avg_verify_us = avg_alu_verify_us,
+                alu_verify_us,
+                avg_alu_verify_us,
+                seal_close_ops = diag_seal_close_ops,
+                closed_seals = diag_closed_seals,
+                seal_close_us,
+                avg_seal_close_us,
+                read_us,
+                known_check_us,
+                subset_us,
+                seal_map_us,
+                resolve_us,
+                opid_us,
+                pub_id_us,
+                seal_to_src_us,
+                apply_us,
+                apply_op_us,
+                apply_seal_us,
+                apply_witness_us,
+                apply_seals_us,
+                misc_us,
+                total_us,
+                "verify serial timing breakdown"
+            );
         }
 
         Ok(())
     }
+
 }
 
 impl<Seal: RgbSeal, C: ContractApi<Seal>> ContractVerify<Seal> for C {}
@@ -415,6 +736,25 @@ mod test {
         fn repo(&self) -> &impl LibRepo { self }
         fn memory(&self) -> &impl Memory { self }
         fn is_known(&self, opid: Opid) -> bool { self.known_ops.contains_key(&opid) }
+        fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<TxoSeal>) -> bool {
+            self.witnesses
+                .get(&opid)
+                .is_some_and(|witnesses| witnesses.contains(witness))
+        }
+        fn known_seal(&mut self, addr: CellAddr) -> Option<TxoSeal> {
+            self.seal_definitions
+                .get(&addr.opid)?
+                .get(&addr.pos)?
+                .to_src()
+        }
+        fn are_seals_known(&mut self, opid: Opid, seals: &SmallOrdMap<u16, WTxoSeal>) -> bool {
+            let Some(stored) = self.seal_definitions.get(&opid) else {
+                return false;
+            };
+            seals
+                .iter()
+                .all(|(no, seal)| stored.get(no).is_some_and(|stored| stored == seal))
+        }
         fn apply_operation(&mut self, op: VerifiedOperation) {
             let opid = op.opid();
             let op = op.into_operation();
@@ -426,6 +766,15 @@ mod test {
                 self.owned.insert(CellAddr::new(opid, no as u16), *inp);
             }
             self.known_ops.insert(opid, op);
+        }
+        fn stage_known_operation(&mut self, opid: Opid, operation: &Operation) {
+            for (no, inp) in operation.immutable_out.iter().enumerate() {
+                self.global
+                    .insert(CellAddr::new(opid, no as u16), inp.value);
+            }
+            for (no, inp) in operation.destructible_out.iter().enumerate() {
+                self.owned.insert(CellAddr::new(opid, no as u16), *inp);
+            }
         }
         fn apply_seals(&mut self, opid: Opid, seals: SmallOrdMap<u16, WTxoSeal>) {
             self.seal_definitions.entry(opid).or_default().extend(seals);
@@ -518,6 +867,75 @@ mod test {
             destructible_out: Default::default(),
             immutable_out: Default::default(),
         }
+    }
+
+    fn seal_source_op(tag: u64, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: Default::default(),
+            immutable_in: Default::default(),
+            destructible_out: small_vec![StateCell {
+                data: StateValue::None,
+                auth: SEAL_1.auth_token(),
+                lock: None
+            }],
+            immutable_out: small_vec![StateData::new(0u64, tag)],
+        }
+    }
+
+    fn seal_consumer_op(source: Opid, contract_id: ContractId) -> Operation {
+        Operation {
+            version: default!(),
+            contract_id,
+            call_id: 0,
+            nonce: fe256::ZERO,
+            witness: StateValue::None,
+            destructible_in: small_vec![Input { addr: CellAddr::new(source, 0), witness: StateValue::None }],
+            immutable_in: Default::default(),
+            destructible_out: Default::default(),
+            immutable_out: small_vec![StateData::new(0u64, 99u64)],
+        }
+    }
+
+    #[test]
+    fn known_skip_stages_outputs_for_later_new_operation() {
+        let genesis = genesis();
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+        let contract_id = contract().contract_id;
+        let producer = seal_source_op(21, contract_id);
+        let producer_opid = producer.opid();
+        let consumer = seal_consumer_op(producer_opid, contract_id);
+        let known_witness = SealWitness::new(strict_dumb!(), strict_dumb!());
+
+        let mut contract = contract();
+        contract.known_ops.insert(producer_opid, producer.clone());
+        contract
+            .seal_definitions
+            .insert(producer_opid, map! { 0 => SEAL_1 });
+        contract
+            .witnesses
+            .insert(producer_opid, vec![known_witness.clone()]);
+
+        let err = contract
+            .evaluate(TestReader::new(vec![
+                OperationSeals { operation: genesis_op, defined_seals: none!(), witness: None },
+                OperationSeals {
+                    operation: producer,
+                    defined_seals: small_bmap! { 0 => SEAL_1 },
+                    witness: Some(known_witness),
+                },
+                OperationSeals { operation: consumer, defined_seals: none!(), witness: None },
+            ]))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no witness known for the operation"),
+            "expected verification to pass the staged known output and fail later on missing witness, got: {err}"
+        );
     }
 
     #[allow(clippy::result_large_err)]

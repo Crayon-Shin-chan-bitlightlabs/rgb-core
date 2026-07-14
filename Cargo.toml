@@ -25,12 +25,17 @@ single_use_seals = { version = "~0.12.0", features = ["strict_encoding"] }
 ultrasonic = "0.12.0"
 bp-core = { version = "0.12.0", optional = true }
 serde = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [features]
 default = ["std", "bitcoin"]
 all = ["std", "bitcoin", "liquid", "prime", "serde"]
 
 std = []
+
+# Diagnostics-only: emit operation-count and timing metrics from serial
+# verification via tracing. Off by default; pure observation, no semantic change.
+verify-diagnostics = ["std", "dep:tracing"]
 
 bitcoin = ["bp-core"]
 liquid = ["bp-core"]
