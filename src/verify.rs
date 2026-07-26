@@ -361,13 +361,12 @@ pub trait ContractVerify<Seal: RgbSeal>: ContractApi<Seal> {
             // we know their commitment auth token but do not know the definition.
             #[cfg(feature = "verify-diagnostics")]
             let subset_started_at = diag_enabled.then(std::time::Instant::now);
-            let reported_is_subset = block.defined_seals.values().all(|seal| {
-                let auth = seal.auth_token();
+            let reported_is_subset = block.defined_seals.iter().all(|(pos, seal)| {
                 block
                     .operation
                     .destructible_out
-                    .iter()
-                    .any(|cell| cell.auth == auth)
+                    .get(usize::from(*pos))
+                    .is_some_and(|cell| cell.auth == seal.auth_token())
             });
             #[cfg(feature = "verify-diagnostics")]
             if let Some(subset_started_at) = subset_started_at {
@@ -1029,6 +1028,40 @@ Sources for the reported seals: {
             witness: None,
         }]);
         run(reader).unwrap();
+    }
+
+    #[test]
+    fn seal_definitions_must_match_the_reported_output_positions() {
+        let mut genesis = genesis();
+        let other_seal = WTxoSeal::strict_dumb();
+        assert_ne!(SEAL_1.auth_token(), other_seal.auth_token());
+        genesis.destructible_out = small_vec![
+            StateCell {
+                data: StateValue::None,
+                auth: SEAL_1.auth_token(),
+                lock: None
+            },
+            StateCell {
+                data: StateValue::None,
+                auth: other_seal.auth_token(),
+                lock: None
+            }
+        ];
+        let genesis_op = genesis.to_operation(genesis.codex_id.to_byte_array().into());
+
+        let mut contract = contract();
+        let err = contract
+            .evaluate(TestReader::new(vec![OperationSeals {
+                operation: genesis_op,
+                defined_seals: small_bmap! {
+                    0 => other_seal,
+                    1 => SEAL_1,
+                },
+                witness: None,
+            }]))
+            .unwrap_err();
+
+        assert!(matches!(err, VerificationError::SealsDefinitionMismatch { .. }));
     }
 
     #[test]
